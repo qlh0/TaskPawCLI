@@ -6,23 +6,6 @@
 
 TaskPawCLI（命令 `taskpaw`）是一个运行在终端里的 AI Agent CLI，面向真实项目开发场景：读写文件、搜索代码、执行命令、联网检索、调用 MCP 工具、保存记忆、生成快照、恢复现场，并通过 Runtime API 对外提供线程、turn、事件和后台任务能力。
 
-它 fork 自 [PaiCLI-Python](https://github.com/itwanger/PaiCLI-Python)（MIT），在此基础上做了重命名、循环治理（LoopGuard）等改造；上游的版权声明保留在 [LICENSE](LICENSE) 中。
-
-这个仓库不是空壳 Demo：核心路径有测试覆盖，也经过本地 smoke 和真实终端运行验证。
-
-## 与上游 PaiCLI 的关系
-
-本项目的架构与大部分实现来自上游 [PaiCLI-Python](https://github.com/itwanger/PaiCLI-Python)，重命名后作为独立项目维护。上游还提供了一条面向学习/求职的教程路线（以 Java 版为主）：
-
-[PaiCLI 学习路线：手搓一个 Java 版 Claude Code](https://paicoding.com/paicli-learning-path)
-
-- 先把 CLI 在本地跑起来，直观看到 ReAct、工具调用、Plan 模式和联网搜索是怎么工作的
-- 再把项目能力拆成可以写进简历的模块，比如 ReAct、Plan-and-Execute、Memory、RAG、MCP、HITL、多模态和 Runtime API
-- 然后围绕简历里写到的模块去深挖源码，并同步准备对应的 Agent 面试题
-- 最后通过 debug、改 bug、加工具、整理踩坑笔记，把项目真正变成自己的工程经验
-
-教程目录覆盖实战篇、简历篇和面试篇，适合作为理解本项目设计取舍的路线图。
-
 ## 功能特性
 
 - 交互式终端 Agent，基于 Rich 和 prompt-toolkit 渲染
@@ -489,14 +472,6 @@ uv run taskpaw --plain -p hello
 
 贡献流程与目录说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，版本变更见 [CHANGELOG.md](CHANGELOG.md)。
 
-## 与上游 Java / TypeScript 版本的关系
-
-TaskPawCLI 的 Python 实现覆盖了上游 Java / TypeScript 版本里公开、开放协议相关的主要 Agent CLI 能力，包括 CLI、REPL、ReAct、Plan-and-Execute、Multi-Agent、Skill、SDK、工具调用、MCP、Runtime API、记忆、快照、联网工具和图片输入。
-
-上游 Java 版本里还有一个私有的微信 iLink 通道。本项目没有内置这个私有通道，因为它依赖账号、扫码登录和协议凭证，不应该用假实现冒充。
-
-更详细的实现对齐情况见 [docs/parity.md](docs/parity.md)。
-
 ## License
 
-MIT. See [LICENSE](LICENSE). 原始版权归 PaiCLI 作者所有，本项目的修改在相同许可下发布。
+MIT. See [LICENSE](LICENSE).
