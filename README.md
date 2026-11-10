@@ -487,6 +487,8 @@ uv run taskpaw doctor --cwd .
 uv run taskpaw --plain -p hello
 ```
 
+贡献流程与目录说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，版本变更见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 与上游 Java / TypeScript 版本的关系
 
 TaskPawCLI 的 Python 实现覆盖了上游 Java / TypeScript 版本里公开、开放协议相关的主要 Agent CLI 能力，包括 CLI、REPL、ReAct、Plan-and-Execute、Multi-Agent、Skill、SDK、工具调用、MCP、Runtime API、记忆、快照、联网工具和图片输入。
