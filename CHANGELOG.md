@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Plan 模式失败梯度：子任务重试（默认 3 次，预算耗尽/权限拒绝等确定性失败不重试）→
+  失败子图局部重规划（默认 1 次）→ 依赖级联跳过 → 如实汇报。
+- 新增 `plan` 配置段：`max_task_retries`、`max_repairs`。
+- 新事件：`plan_task_retry`、`plan_repair_started`、`plan_repair_result`、`plan_repaired`。
+
+### Fixed
+
+- 被 LoopGuard 收尾的子任务不再被误记为已完成（现在按失败处理并进入重试/修复）。
+- 失败子任务及其重试消耗的 token / turns 现在计入总账。
+- Plan 失败时 `stop_reason` 为 `plan_failed`，不再误报 `end_turn`。
+- 依赖失败任务的下游任务标记为「已跳过」，最终摘要区分完成 / 失败 / 跳过。
+
 ## v0.1.0
 
 首个公开版本（fork 自 [PaiCLI-Python](https://github.com/itwanger/PaiCLI-Python)，MIT）。

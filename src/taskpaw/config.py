@@ -130,6 +130,16 @@ class LoopConfig:
 
 
 @dataclass(slots=True)
+class PlanConfig:
+    """Failure handling for Plan-and-Execute runs."""
+
+    # How many times a single subtask is retried before it is marked failed.
+    max_task_retries: int = 3
+    # How many times a failed subgraph may be replaced by a locally repaired one.
+    max_repairs: int = 1
+
+
+@dataclass(slots=True)
 class TaskPawConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
     render_mode: str = "inline"
@@ -140,6 +150,7 @@ class TaskPawConfig:
     prompt: PromptConfig = field(default_factory=PromptConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
+    plan: PlanConfig = field(default_factory=PlanConfig)
 
 
 def load_config(
@@ -319,6 +330,7 @@ def _dict_to_config(data: dict[str, Any]) -> TaskPawConfig:
         prompt=PromptConfig(**data.get("prompt", {})),
         features=FeatureConfig(**data.get("features", {})),
         loop=LoopConfig(**data.get("loop", {})),
+        plan=PlanConfig(**data.get("plan", {})),
     )
 
 

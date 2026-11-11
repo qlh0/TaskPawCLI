@@ -9,7 +9,7 @@ from typing import Any
 from taskpaw.agent.query import query
 from taskpaw.config import TaskPawConfig
 from taskpaw.llm.base import LlmClient
-from taskpaw.plan import ExecutionPlan, Planner, Task, TaskStatus
+from taskpaw.plan import ExecutionPlan, Planner, PlanStatus, Task, TaskStatus
 from taskpaw.prompt import PromptAssembler
 from taskpaw.skill import SkillContextBuffer
 from taskpaw.snapshot import SnapshotService
@@ -24,6 +24,7 @@ class TaskRunResult:
     usage: Usage
     turns: int
     error: Exception | None = None
+    stop_reason: str = "end_turn"
 
     @property
     def tokens(self) -> int:
@@ -81,9 +82,8 @@ class PlanExecuteAgent:
                     continue
                 elif event.get("type") == "text_delta":
                     final_text += str(event.get("text") or "")
-                elif event.get("type") == "loop_wrapup":
-                    stop_reason = str(event.get("reason") or "turn_cap")
                 yield event
+            stop_reason = "end_turn" if plan.status == PlanStatus.COMPLETED else "plan_failed"
             self.history = [
                 Message(role="user", content=message),
                 Message(role="assistant", content=final_text),
@@ -111,10 +111,22 @@ class PlanExecuteAgent:
         yield {"type": "text_delta", "text": "开始执行计划……\n\n"}
         yield {"type": "plan_status", "phase": "execution"}
         plan.mark_started()
+        repairs = 0
         while True:
             executable = _executable_tasks_in_order(plan)
             if not executable:
+                if plan.has_failed() and repairs < max(0, self.config.plan.max_repairs):
+                    repairs += 1
+                    repaired = False
+                    async for event in self._repair_plan(plan, attempt=repairs):
+                        if event.get("type") == "plan_repair_result":
+                            repaired = bool(event.get("ok"))
+                        else:
+                            yield event
+                    if repaired:
+                        continue
                 break
+
             if len(executable) == 1:
                 result: TaskRunResult | None = None
                 async for event in self._execute_task_stream(plan, executable[0]):
@@ -127,6 +139,7 @@ class PlanExecuteAgent:
                 async for event in self._apply_task_result(result):
                     yield event
                 continue
+
             yield {
                 "type": "text_delta",
                 "text": (f"正在并行执行：{', '.join(task.id for task in executable)}\n\n"),
@@ -169,34 +182,98 @@ class PlanExecuteAgent:
                 async for event in self._apply_task_result(result):
                     yield event
 
-        if plan.has_failed():
-            plan.mark_failed()
-            yield {"type": "text_delta", "text": "计划部分完成，但有任务执行失败。\n\n"}
-        elif plan.is_all_completed():
-            plan.mark_completed()
-            yield {"type": "text_delta", "text": _build_plan_result(plan)}
-        else:
-            plan.mark_failed()
+        skipped = plan.skip_blocked()
+        if skipped:
             yield {
                 "type": "text_delta",
-                "text": "计划已停滞，因为任务依赖未满足。\n\n",
+                "text": f"因依赖失败被跳过：{', '.join(task.id for task in skipped)}\n\n",
             }
+
+        if plan.is_all_completed():
+            plan.mark_completed()
+            title = "计划执行完成。"
+        elif plan.has_failed():
+            plan.mark_failed()
+            title = "计划部分完成，但有任务执行失败。"
+        else:
+            plan.mark_failed()
+            title = "计划已停滞，因为任务依赖未满足。"
+        yield {"type": "text_delta", "text": f"{title}\n\n{_build_plan_result(plan)}"}
 
     async def _apply_task_result(self, result: TaskRunResult) -> AsyncIterator[dict[str, Any]]:
         if result.error:
             result.task.mark_failed(str(result.error))
             yield {"type": "text_delta", "text": f"失败 [{result.task.id}]：{result.error}\n\n"}
-            return
-        result.task.mark_completed(result.text)
+        else:
+            result.task.mark_completed(result.text)
+            yield {
+                "type": "text_delta",
+                "text": f"已完成 [{result.task.id}]：{_preview(result.text)}\n\n",
+            }
+        yield {"type": "usage", "usage": result.usage.to_dict()}
+        yield {
+            "type": "plan_task_done",
+            "task_id": result.task.id,
+            "turns": result.turns,
+            "tokens": result.tokens,
+            "failed": bool(result.error),
+        }
+
+    async def _repair_plan(
+        self,
+        plan: ExecutionPlan,
+        *,
+        attempt: int,
+    ) -> AsyncIterator[dict[str, Any]]:
+        failed = [task for task in plan.all_tasks() if task.status == TaskStatus.FAILED]
+        failed_ids = [task.id for task in failed]
+        reason = "; ".join(f"{task.id}: {task.error}" for task in failed) or "unknown failure"
         yield {
             "type": "text_delta",
-            "text": f"已完成 [{result.task.id}]：{_preview(result.text)}\n\n",
+            "text": f"局部重规划（第 {attempt} 次）：替换失败任务 {', '.join(failed_ids)}……\n\n",
+        }
+        yield {"type": "plan_repair_started", "attempt": attempt, "failed_ids": failed_ids}
+        try:
+            replacement, usage = await self.planner.repair(
+                plan,
+                failed_ids,
+                reason,
+                attempt=attempt,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed repair must not abort the run
+            yield {"type": "plan_repair_result", "ok": False, "error": str(exc)}
+            yield {"type": "text_delta", "text": f"局部重规划失败：{exc}\n\n"}
+            return
+
+        yield {"type": "usage", "usage": usage.to_dict()}
+        if not replacement:
+            yield {"type": "plan_repair_result", "ok": False, "error": "empty replacement"}
+            yield {
+                "type": "text_delta",
+                "text": "局部重规划没有返回可用任务，保留原计划。\n\n",
+            }
+            return
+
+        added = plan.apply_repair(replacement, attempt=attempt)
+        if not added:
+            yield {"type": "plan_repair_result", "ok": False, "error": "merge failed"}
+            yield {
+                "type": "text_delta",
+                "text": "局部重规划结果无法合并（存在环或依赖非法），保留原计划。\n\n",
+            }
+            return
+
+        yield {
+            "type": "plan_repair_result",
+            "ok": True,
+            "task_ids": [task.id for task in added],
         }
         yield {
-            "type": "usage",
-            "usage": result.usage.to_dict(),
+            "type": "plan_repaired",
+            "attempt": attempt,
+            "task_ids": [task.id for task in added],
         }
-        yield {"type": "plan_task_done", "turns": result.turns, "tokens": result.tokens}
+        yield {"type": "text_delta", "text": plan.summarize() + "\n\n"}
 
     async def _pump_task_events(
         self,
@@ -221,16 +298,115 @@ class PlanExecuteAgent:
             "task_id": task.id,
             "task_description": task.description,
         }
+
+        max_retries = max(0, int(self.config.plan.max_task_retries))
+        total_usage = Usage()
+        total_turns = 0
+        attempts = 0
+        retry_context = ""
+        last_error: Exception | None = None
+        last_stop_reason = "end_turn"
+
+        while attempts <= max_retries:
+            attempts += 1
+            task.attempts = attempts
+            if attempts > 1:
+                reason_text = str(last_error or f"stop_reason={last_stop_reason}")
+                yield {
+                    "type": "plan_task_retry",
+                    "task_id": task.id,
+                    "attempt": attempts,
+                    "max_attempts": max_retries + 1,
+                    "reason": reason_text,
+                }
+                yield {
+                    "type": "text_delta",
+                    "text": (
+                        f"重试 [{task.id}] 第 {attempts}/{max_retries + 1} 次："
+                        f"{_preview(reason_text, 120)}\n\n"
+                    ),
+                }
+
+            attempt_result: TaskRunResult | None = None
+            async for event in self._run_task_attempt(plan, task, retry_context):
+                if event.get("type") == "plan_task_result":
+                    attempt_result = event["result"]
+                else:
+                    yield event
+            if attempt_result is None:
+                attempt_result = TaskRunResult(
+                    task=task,
+                    text="",
+                    usage=Usage(),
+                    turns=0,
+                    error=RuntimeError(f"task {task.id} produced no result"),
+                )
+
+            total_usage = total_usage + attempt_result.usage
+            total_turns += attempt_result.turns
+            last_error = attempt_result.error
+            last_stop_reason = attempt_result.stop_reason
+
+            finished = (
+                attempt_result.error is None
+                and attempt_result.stop_reason == "end_turn"
+                and bool(attempt_result.text.strip())
+            )
+            if finished:
+                yield {
+                    "type": "plan_task_result",
+                    "result": TaskRunResult(
+                        task=task,
+                        text=attempt_result.text,
+                        usage=total_usage,
+                        turns=total_turns,
+                    ),
+                }
+                return
+
+            if not self._should_retry(attempt_result):
+                break
+            retry_context = _retry_context(attempt_result)
+
+        error = last_error or RuntimeError(f"task stopped early: {last_stop_reason}")
+        yield {
+            "type": "plan_task_result",
+            "result": TaskRunResult(
+                task=task,
+                text="",
+                usage=total_usage,
+                turns=total_turns,
+                error=error,
+                stop_reason=last_stop_reason,
+            ),
+        }
+
+    async def _run_task_attempt(
+        self,
+        plan: ExecutionPlan,
+        task: Task,
+        retry_context: str,
+    ) -> AsyncIterator[dict[str, Any]]:
+        yield {
+            "type": "plan_task_attempt",
+            "task_id": task.id,
+            "attempt": task.attempts,
+        }
         text = ""
         tool_results: list[str] = []
         usage = Usage()
+        stream_usage = Usage()
         turns = 0
+        stop_reason = "end_turn"
+        user_message = _task_context(plan, task)
+        if retry_context:
+            user_message = f"{user_message}\n\n{retry_context}"
         try:
             async for event in query(
                 llm_client=self.llm_client,
                 tool_registry=self.tool_registry,
                 system_prompt=self._task_system_prompt(plan, task),
-                user_message=_task_context(plan, task),
+                user_message=user_message,
                 history=[],
                 cwd=self.cwd,
                 config=self.config,
@@ -239,28 +415,42 @@ class PlanExecuteAgent:
                 skill_context_buffer=SkillContextBuffer(),
                 max_turns=self.max_task_turns,
             ):
-                if event.get("type") == "text_delta":
+                event_type = event.get("type")
+                if event_type == "text_delta":
                     text += str(event.get("text") or "")
-                elif event.get("type") == "tool_result":
+                elif event_type == "tool_result":
                     content = str(event.get("result") or "")
                     if content:
                         tool_results.append(content)
                     yield _with_task_context(event, task)
-                elif event.get("type") in {
+                elif event_type in {
                     "thinking_delta",
                     "tool_call",
                     "context_compressed",
+                    "loop_warning",
+                    "loop_extended",
+                    "loop_wrapup",
                 }:
                     yield _with_task_context(event, task)
-                elif event.get("type") == "done":
+                elif event_type == "usage":
+                    stream_usage = stream_usage + Usage.from_mapping(event.get("usage") or {})
+                elif event_type == "done":
                     turns += int(event.get("total_turns") or 0)
-                    usage = usage + Usage.from_mapping(event.get("usage") or {})
-                elif event.get("type") == "error":
+                    done_usage = Usage.from_mapping(event.get("usage") or {})
+                    usage = done_usage if done_usage.total_tokens else stream_usage
+                    stop_reason = str(event.get("stop_reason") or "end_turn")
+                elif event_type == "error":
                     raise event["error"]
             result_text = text.strip() or "\n".join(tool_results).strip()
             yield {
                 "type": "plan_task_result",
-                "result": TaskRunResult(task=task, text=result_text, usage=usage, turns=turns),
+                "result": TaskRunResult(
+                    task=task,
+                    text=result_text,
+                    usage=usage,
+                    turns=turns,
+                    stop_reason=stop_reason,
+                ),
             }
         except Exception as exc:  # noqa: BLE001
             yield {
@@ -268,11 +458,29 @@ class PlanExecuteAgent:
                 "result": TaskRunResult(
                     task=task,
                     text="",
-                    usage=usage,
+                    usage=usage if usage.total_tokens else stream_usage,
                     turns=turns,
                     error=exc,
+                    stop_reason=stop_reason,
                 ),
             }
+
+    @staticmethod
+    def _should_retry(result: TaskRunResult) -> bool:
+        """Fatal outcomes (budget, policy) are not worth retrying."""
+
+        if result.stop_reason in {"budget_exhausted", "hard_cap"}:
+            return False
+        text = str(result.error or "").lower()
+        fatal_markers = (
+            "permission denied",
+            "access denied",
+            "拒绝访问",
+            "blocked by policy",
+            "command guard",
+            "path guard",
+        )
+        return not any(marker in text for marker in fatal_markers)
 
     def _task_system_prompt(self, plan: ExecutionPlan, task: Task) -> str:
         base = PromptAssembler(
@@ -319,6 +527,20 @@ def _task_context(plan: ExecutionPlan, task: Task) -> str:
     return "\n".join(lines)
 
 
+def _retry_context(result: TaskRunResult) -> str:
+    reason = (
+        str(result.error)
+        if result.error
+        else f"上一次尝试未正常结束（stop_reason={result.stop_reason}）"
+    )
+    return (
+        "上一次尝试失败，原因：\n"
+        f"{_preview(reason, 600)}\n\n"
+        "请先检查工作区当前状态（可能已经部分写入或已有副作用），换一种做法再试；"
+        "不要重复上一次失败的操作。"
+    )
+
+
 def _build_plan_result(plan: ExecutionPlan) -> str:
     status_labels = {
         TaskStatus.PENDING: "待执行",
@@ -327,10 +549,17 @@ def _build_plan_result(plan: ExecutionPlan) -> str:
         TaskStatus.FAILED: "失败",
         TaskStatus.SKIPPED: "已跳过",
     }
-    lines = ["计划执行完成。", "", "任务摘要："]
+    counts = plan.status_counts()
+    lines = [
+        f"任务摘要：共 {len(plan.all_tasks())} 个任务，"
+        f"已完成 {counts['COMPLETED']}，失败 {counts['FAILED']}，跳过 {counts['SKIPPED']}。",
+        "",
+    ]
     for task in plan.all_tasks():
         lines.append(f"- [{task.id}] {status_labels[task.status]}：{task.description}")
-        if task.result:
+        if task.status == TaskStatus.FAILED and task.error:
+            lines.append(f"  失败原因：{_preview(task.error, 200)}")
+        elif task.result:
             lines.append(f"  结果：{_preview(task.result)}")
     return "\n".join(lines) + "\n"
 
@@ -355,7 +584,8 @@ def _calculate_costs(llm_client: LlmClient, usage: Usage) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for currency in ("usd", "cny"):
         try:
-            result[currency] = calculator(usage, currency=currency).to_dict()
+            breakdown = calculator(usage, currency=currency)
         except (KeyError, TypeError, ValueError):
             continue
+        result[currency] = breakdown.to_dict()
     return result

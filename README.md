@@ -266,6 +266,32 @@ ReAct 循环由 `LoopGuard` 守护，避免死循环、空转和静默截断：
 }
 ```
 
+## Plan 模式的失败处理
+
+Plan 模式的失败不是"一失败就结束"，而是一条梯度：
+
+1. **子任务重试**：失败后带着上一次的错误原因重试，默认最多 3 次；预算耗尽、权限拒绝
+   这类确定性失败不会重试。
+2. **局部重规划**：重试仍失败时，只把「失败任务 + 它的下游」这一段交给规划器重写，
+   已完成的任务保留、结果复用；最多 1 次。
+3. **依赖级联跳过**：仍然失败时，依赖它的下游任务标记为「已跳过」，其余独立分支继续执行。
+4. **如实汇报**：最终摘要区分「已完成 / 失败 / 已跳过」，`stop_reason` 为 `plan_failed`
+   而不是误报 `end_turn`。
+
+被 ReAct 层 `LoopGuard` 收尾的子任务同样按失败处理（不会再被记成"已完成"），
+失败尝试消耗的 token 也会计入总账。
+
+配置项在 `plan` 段：
+
+```json
+{
+  "plan": {
+    "max_task_retries": 3,
+    "max_repairs": 1
+  }
+}
+```
+
 ## 模型、Token 与费用
 
 默认 provider/model 是 `deepseek/deepseek-v4-flash`。DeepSeek V4 Flash/Pro 的内置 profile 使用 1M 上下文，并带有截至 2026-07-17 的官方每百万 Token 价格；价格会变化，因此可以用 `llm.context_window` 和 `llm.prices` 覆盖，未知 OpenAI-compatible 模型应显式配置。
