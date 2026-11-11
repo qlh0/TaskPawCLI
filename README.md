@@ -270,7 +270,8 @@ ReAct 循环由 `LoopGuard` 守护，避免死循环、空转和静默截断：
 
 **计划审批门**：REPL 里规划完成后会先停下来确认（`y=执行 / n=取消 / e=提修改意见`）。
 选 `e` 会把意见带回规划器重新生成计划（默认最多 2 次），选 `n` 则一个任务都不会执行、
-`stop_reason=plan_cancelled`。非交互模式（`-p`）默认不拦截，可用 `plan.require_approval` 打开。
+`stop_reason=plan_cancelled`。审批门由 `plan.require_approval` 控制，且只在调用方提供了
+审批回调时生效——REPL 已内置；`-p` 等非交互路径默认不拦截，通过 SDK 调用时可以自行传入回调。
 
 **失败梯度**：失败不是"一失败就结束"，而是：
 
