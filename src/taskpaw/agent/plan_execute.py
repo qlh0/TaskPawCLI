@@ -20,6 +20,7 @@ from taskpaw.plan import (
     resources_conflict,
 )
 from taskpaw.plan.store import PlanStore
+from taskpaw.plan.verifier import TaskVerifier
 from taskpaw.prompt import PromptAssembler
 from taskpaw.skill import SkillContextBuffer
 from taskpaw.snapshot import SnapshotService
@@ -64,6 +65,7 @@ class PlanExecuteAgent:
         self.max_task_turns = max_task_turns
         self.plan_approval_callback = plan_approval_callback
         self.history: list[Message] = []
+        self.verifier = TaskVerifier(llm_client, cwd) if config.plan.verify_tasks else None
         self.store = (
             PlanStore(max_plans=config.plan.max_history_plans) if config.plan.keep_history else None
         )
@@ -527,6 +529,33 @@ class PlanExecuteAgent:
                 and attempt_result.stop_reason == "end_turn"
                 and bool(attempt_result.text.strip())
             )
+
+            if finished and self.verifier is not None:
+                verdict = await self.verifier.verify(plan, task, attempt_result.text)
+                if verdict.usage.total_tokens:
+                    total_usage = total_usage + verdict.usage
+                yield {
+                    "type": "plan_task_verified",
+                    "task_id": task.id,
+                    "passed": verdict.passed,
+                    "reason": verdict.reason,
+                }
+                if not verdict.passed:
+                    reason = verdict.reason or "未通过验收"
+                    if verdict.issues:
+                        reason = f"{reason}（{'；'.join(verdict.issues[:3])}）"
+                    attempt_result = TaskRunResult(
+                        task=task,
+                        text=attempt_result.text,
+                        usage=attempt_result.usage,
+                        turns=attempt_result.turns,
+                        error=RuntimeError(f"验收未通过：{reason}"),
+                        stop_reason="verify_rejected",
+                    )
+                    last_error = attempt_result.error
+                    last_stop_reason = attempt_result.stop_reason
+                    finished = False
+
             if finished:
                 yield {
                     "type": "plan_task_result",
@@ -724,6 +753,13 @@ def _retry_context(result: TaskRunResult) -> str:
         if result.error
         else f"上一次尝试未正常结束（stop_reason={result.stop_reason}）"
     )
+    if result.stop_reason == "verify_rejected":
+        return (
+            "上一轮产出未通过验收，原因：\n"
+            f"{_preview(reason, 600)}\n\n"
+            "请针对验收意见补齐缺失的步骤或证据，重新完成这个任务；"
+            "如果已经写过文件，先检查它们的当前内容再修改。"
+        )
     return (
         "上一次尝试失败，原因：\n"
         f"{_preview(reason, 600)}\n\n"

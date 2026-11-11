@@ -57,6 +57,11 @@ class ScriptedClient:
         body = _text(messages[-1].content)
         self.user_messages.append(body)
 
+        if "子任务验收器" in system_prompt:
+            yield {"type": "text_delta", "text": '{"passed": true, "reason": "ok"}'}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+            return
+
         if "请为以下目标创建执行计划" in body:
             yield {"type": "text_delta", "text": self.plan}
             yield {"type": "message_end", "stop_reason": "end_turn"}

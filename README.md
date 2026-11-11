@@ -273,6 +273,11 @@ ReAct 循环由 `LoopGuard` 守护，避免死循环、空转和静默截断：
 `stop_reason=plan_cancelled`。审批门由 `plan.require_approval` 控制，且只在调用方提供了
 审批回调时生效——REPL 已内置；`-p` 等非交互路径默认不拦截，通过 SDK 调用时可以自行传入回调。
 
+**子任务验收**：子任务结束时不会直接算"完成"，而是先过两道验收——
+① 声明过的 `file:` / `dir:` 资源必须真实存在（确定性检查，不花 token）；
+② 一次模型验收调用判断产出是否真的完成了任务描述，不通过则带着验收意见重试。
+验收器输出无法解析时按"通过"处理，避免因为解析问题卡住整个计划。可用 `plan.verify_tasks=false` 关闭。
+
 **失败梯度**：失败不是"一失败就结束"，而是：
 1. **子任务重试**：失败后带着上一次的错误原因重试，默认最多 3 次；预算耗尽、权限拒绝
    这类确定性失败不会重试。
@@ -295,6 +300,7 @@ ReAct 循环由 `LoopGuard` 守护，避免死循环、空转和静默截断：
     "require_approval": false,
     "max_plan_revisions": 2,
     "max_parallel_tasks": 4,
+    "verify_tasks": true,
     "keep_history": true,
     "max_history_plans": 50
   }

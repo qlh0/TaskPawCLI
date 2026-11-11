@@ -27,6 +27,10 @@ class ApprovalClient:
 
     async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
         body = _text(messages[-1].content)
+        if "子任务验收器" in system_prompt:
+            yield {"type": "text_delta", "text": '{"passed": true, "reason": "ok"}'}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+            return
         if "请为以下目标创建执行计划" in body:
             self.plan_calls += 1
             yield {"type": "text_delta", "text": PLAN_B if "修改意见" in body else PLAN_A}

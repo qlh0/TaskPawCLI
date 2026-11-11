@@ -30,6 +30,7 @@ LOGGABLE_EVENTS = frozenset(
         "plan_task_attempt",
         "plan_task_retry",
         "plan_task_done",
+        "plan_task_verified",
         "plan_repair_started",
         "plan_repair_result",
         "plan_repaired",

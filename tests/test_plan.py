@@ -135,6 +135,10 @@ class ParallelPlanClient(FakeClient):
 
     async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
         body = _message_text(messages[-1].content)
+        if "子任务验收器" in system_prompt:
+            yield {"type": "text_delta", "text": '{"passed": true, "reason": "ok"}'}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+            return
         if "请为以下目标创建执行计划" in body:
             yield {"type": "thinking_delta", "thinking": "先拆分可并行任务"}
             yield {

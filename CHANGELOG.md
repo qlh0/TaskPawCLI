@@ -10,10 +10,13 @@
   失败子图局部重规划（默认 1 次）→ 依赖级联跳过 → 如实汇报。
 - 资源感知调度：规划器为任务声明 `resources`（file/dir/workspace/service），
   写冲突自动补依赖边转为串行；`plan.max_parallel_tasks` 限制并发（0 不限，1 串行）。
+- 子任务验收：任务结束先做声明的 `file:`/`dir:` 存在性检查，再由一次模型调用判断是否真的完成；
+  不通过则带验收意见重试，可用 `plan.verify_tasks` 关闭。
 - Plan 历史持久化：`~/.taskpaw/plans.db` 记录计划、任务状态与关键事件，
   新增 `taskpaw plan list|show|events`。
 - 新增 `plan` 配置段：`max_task_retries`、`max_repairs`、`require_approval`、
-  `max_plan_revisions`、`max_parallel_tasks`、`keep_history`、`max_history_plans`。
+  `max_plan_revisions`、`max_parallel_tasks`、`verify_tasks`、`keep_history`、
+  `max_history_plans`。
 - 新事件：`plan_ready`、`plan_approved`、`plan_cancelled`、`plan_revision_started`、
   `plan_serialized`、`plan_schedule`、`plan_task_retry`、`plan_repair_started`、
   `plan_repair_result`、`plan_repaired`。

@@ -143,6 +143,8 @@ class PlanConfig:
     max_plan_revisions: int = 2
     # How many subtasks may run at the same time. 0 means unlimited, 1 means serial.
     max_parallel_tasks: int = 4
+    # Ask a verifier whether a subtask really completed before marking it done.
+    verify_tasks: bool = True
     # Persist plans/tasks/events for `taskpaw plan list|show|events`.
     keep_history: bool = True
     max_history_plans: int = 50
