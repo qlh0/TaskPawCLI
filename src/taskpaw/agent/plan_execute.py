@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from inspect import isawaitable
 from typing import Any
 
 from taskpaw.agent.query import query
 from taskpaw.config import TaskPawConfig
 from taskpaw.llm.base import LlmClient
-from taskpaw.plan import ExecutionPlan, Planner, PlanStatus, Task, TaskStatus
+from taskpaw.plan import ExecutionPlan, PlanDecision, Planner, PlanStatus, Task, TaskStatus
 from taskpaw.prompt import PromptAssembler
 from taskpaw.skill import SkillContextBuffer
 from taskpaw.snapshot import SnapshotService
@@ -42,6 +43,8 @@ class PlanExecuteAgent:
         approval_callback=None,
         planner: Planner | None = None,
         max_task_turns: int = 8,
+        plan_approval_callback: Callable[[ExecutionPlan], PlanDecision | Awaitable[PlanDecision]]
+        | None = None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -50,6 +53,7 @@ class PlanExecuteAgent:
         self.approval_callback = approval_callback
         self.planner = planner or Planner(llm_client)
         self.max_task_turns = max_task_turns
+        self.plan_approval_callback = plan_approval_callback
         self.history: list[Message] = []
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
@@ -74,16 +78,72 @@ class PlanExecuteAgent:
             if plan is None:
                 raise ValueError("planner did not produce an execution plan")
             yield {"type": "text_delta", "text": plan.summarize() + "\n\n"}
-            async for event in self._execute_plan(plan):
-                if event.get("type") == "usage":
-                    total_usage = total_usage + Usage.from_mapping(event.get("usage") or {})
-                elif event.get("type") == "plan_task_done":
-                    total_turns += int(event.get("turns") or 0)
-                    continue
-                elif event.get("type") == "text_delta":
-                    final_text += str(event.get("text") or "")
-                yield event
-            stop_reason = "end_turn" if plan.status == PlanStatus.COMPLETED else "plan_failed"
+            yield {
+                "type": "plan_ready",
+                "plan_id": plan.id,
+                "task_count": len(plan.all_tasks()),
+                "summary": plan.summarize(),
+            }
+
+            cancelled = False
+            if self.config.plan.require_approval and self.plan_approval_callback is not None:
+                revisions = 0
+                while True:
+                    decision = await _resolve_plan_decision(self.plan_approval_callback, plan)
+                    if decision.action == "cancel":
+                        cancelled = True
+                        break
+                    if decision.action != "revise":
+                        break
+                    if revisions >= max(0, self.config.plan.max_plan_revisions):
+                        yield {
+                            "type": "text_delta",
+                            "text": "已达到计划修改次数上限，按当前计划执行。\n\n",
+                        }
+                        break
+                    revisions += 1
+                    yield {
+                        "type": "plan_revision_started",
+                        "attempt": revisions,
+                        "feedback": decision.feedback,
+                    }
+                    yield {
+                        "type": "text_delta",
+                        "text": f"按意见重新规划（第 {revisions} 次）……\n\n",
+                    }
+                    try:
+                        plan = await self.planner.create_plan(
+                            _revision_goal(message, decision.feedback)
+                        )
+                    except Exception as exc:  # noqa: BLE001 - keep the previous plan
+                        yield {
+                            "type": "text_delta",
+                            "text": f"重新规划失败：{exc}；继续使用原计划。\n\n",
+                        }
+                        break
+                    total_usage = total_usage + self.planner.last_usage
+                    yield {"type": "text_delta", "text": plan.summarize() + "\n\n"}
+                yield {
+                    "type": "plan_cancelled" if cancelled else "plan_approved",
+                    "plan_id": plan.id,
+                }
+
+            if cancelled:
+                plan.mark_cancelled()
+                stop_reason = "plan_cancelled"
+                final_text += "已取消计划执行，未运行任何任务。\n\n"
+                yield {"type": "text_delta", "text": "已取消计划执行，未运行任何任务。\n\n"}
+            else:
+                async for event in self._execute_plan(plan):
+                    if event.get("type") == "usage":
+                        total_usage = total_usage + Usage.from_mapping(event.get("usage") or {})
+                    elif event.get("type") == "plan_task_done":
+                        total_turns += int(event.get("turns") or 0)
+                        continue
+                    elif event.get("type") == "text_delta":
+                        final_text += str(event.get("text") or "")
+                    yield event
+                stop_reason = "end_turn" if plan.status == PlanStatus.COMPLETED else "plan_failed"
             self.history = [
                 Message(role="user", content=message),
                 Message(role="assistant", content=final_text),
@@ -525,6 +585,22 @@ def _task_context(plan: ExecutionPlan, task: Task) -> str:
         if dep and dep.status == TaskStatus.COMPLETED:
             lines.append(f"- [{dep.id}] {dep.description}: {_preview(dep.result, 800)}")
     return "\n".join(lines)
+
+
+async def _resolve_plan_decision(callback, plan: ExecutionPlan) -> PlanDecision:
+    result = callback(plan)
+    if isawaitable(result):
+        result = await result
+    if isinstance(result, PlanDecision):
+        return result
+    if isinstance(result, str) and result in {"approve", "cancel", "revise"}:
+        return PlanDecision(result)
+    return PlanDecision("approve")
+
+
+def _revision_goal(message: str, feedback: str) -> str:
+    note = feedback.strip() or "请调整任务拆分、顺序或范围。"
+    return f"{message}\n\n用户看过第一版计划后提出了修改意见：{note}\n请据此重新给出完整计划。"
 
 
 def _retry_context(result: TaskRunResult) -> str:

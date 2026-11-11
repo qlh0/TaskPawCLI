@@ -65,6 +65,7 @@ class Agent:
         system_prompt: str | None = None,
         max_turns: int | None = None,
         max_plan_depth: int = 1,
+        plan_approval_callback: Callable | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -75,6 +76,7 @@ class Agent:
         self.max_turns = max_turns or config.loop.max_turns
         self._max_turns_explicit = max_turns is not None
         self.max_plan_depth = max_plan_depth
+        self.plan_approval_callback = plan_approval_callback
 
         # Build the base system prompt from personality profile and config.
         self.system_prompt = (
@@ -225,6 +227,7 @@ class Agent:
             cwd=self.cwd,
             approval_callback=self.approval_callback,
             max_task_turns=self.max_turns,
+            plan_approval_callback=self.plan_approval_callback,
         )
         agent.history = list(self.history)
 

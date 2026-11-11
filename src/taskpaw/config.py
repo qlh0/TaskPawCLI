@@ -131,12 +131,16 @@ class LoopConfig:
 
 @dataclass(slots=True)
 class PlanConfig:
-    """Failure handling for Plan-and-Execute runs."""
+    """Failure handling and human review for Plan-and-Execute runs."""
 
     # How many times a single subtask is retried before it is marked failed.
     max_task_retries: int = 3
     # How many times a failed subgraph may be replaced by a locally repaired one.
     max_repairs: int = 1
+    # Ask the human to approve the plan before any task runs (interactive mode).
+    require_approval: bool = False
+    # How many times the human may ask for the plan to be rewritten.
+    max_plan_revisions: int = 2
 
 
 @dataclass(slots=True)

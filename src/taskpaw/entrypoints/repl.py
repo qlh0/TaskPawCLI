@@ -30,6 +30,7 @@ from taskpaw.llm.model_profiles import (
     ModelProfile,
 )
 from taskpaw.memory import MemoryManager
+from taskpaw.plan import ExecutionPlan, PlanDecision
 from taskpaw.policy import AuditLog
 from taskpaw.prompt import PromptAssembler
 from taskpaw.rag import CodeIndex
@@ -100,6 +101,8 @@ class PermissionModeController:
 async def start_repl(cwd: str, config: TaskPawConfig) -> None:
     console = Console()
     permission_mode = PermissionModeController(config)
+    # Interactive sessions confirm the plan before a single task runs.
+    config.plan.require_approval = True
     registry, mcp_manager = await build_tool_registry(config=config, cwd=cwd)
     client = create_llm_client(config.llm)
     system_prompt = PromptAssembler(
@@ -138,6 +141,7 @@ async def start_repl(cwd: str, config: TaskPawConfig) -> None:
         cwd=cwd,
         config=config,
         approval_callback=lambda request: _approval_prompt(request, console, permission_mode),
+        plan_approval_callback=lambda plan: _plan_approval_prompt(plan, console),
     )
 
     history_path = Path.home() / ".taskpaw" / "history" / "prompt_history.txt"
@@ -292,6 +296,7 @@ async def _handle_slash(
                 config=config,
                 cwd=cwd,
                 approval_callback=agent.approval_callback,
+                plan_approval_callback=lambda plan: _plan_approval_prompt(plan, console),
             )
             await _run_events(
                 plan_agent.run(arg),
@@ -633,6 +638,26 @@ def _snapshot_command(arg: str, console: Console, cwd: str) -> None:
         f"{index}. {row.id} {row.phase} {row.created_at}" for index, row in enumerate(rows, 1)
     )
     console.print(output or "(no snapshots)")
+
+
+def _plan_approval_prompt(plan: ExecutionPlan, console: Console) -> PlanDecision:
+    if not sys.stdin.isatty():
+        return PlanDecision("approve")
+    console.print(
+        f"[yellow]计划待确认[/yellow]：{len(plan.all_tasks())} 个任务，"
+        f"{len(plan.execution_batches())} 个并行批次"
+    )
+    answer = Prompt.ask(
+        "执行这个计划？(y=执行 / n=取消 / e=提修改意见)",
+        choices=["y", "n", "e"],
+        default="y",
+    )
+    if answer == "n":
+        return PlanDecision("cancel")
+    if answer == "e":
+        feedback = Prompt.ask("修改意见").strip()
+        return PlanDecision("revise", feedback)
+    return PlanDecision("approve")
 
 
 def _approval_prompt(

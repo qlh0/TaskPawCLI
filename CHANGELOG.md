@@ -4,10 +4,13 @@
 
 ### Added
 
+- Plan 审批门：REPL 在规划完成后先确认（执行 / 取消 / 提修改意见），修改意见会触发重新规划
+  （默认最多 2 次），取消则一个任务都不执行且 `stop_reason=plan_cancelled`。
 - Plan 模式失败梯度：子任务重试（默认 3 次，预算耗尽/权限拒绝等确定性失败不重试）→
   失败子图局部重规划（默认 1 次）→ 依赖级联跳过 → 如实汇报。
-- 新增 `plan` 配置段：`max_task_retries`、`max_repairs`。
-- 新事件：`plan_task_retry`、`plan_repair_started`、`plan_repair_result`、`plan_repaired`。
+- 新增 `plan` 配置段：`max_task_retries`、`max_repairs`、`require_approval`、`max_plan_revisions`。
+- 新事件：`plan_ready`、`plan_approved`、`plan_cancelled`、`plan_revision_started`、
+  `plan_task_retry`、`plan_repair_started`、`plan_repair_result`、`plan_repaired`。
 
 ### Fixed
 

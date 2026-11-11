@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Literal
 
 
 class TaskType(StrEnum):
@@ -30,6 +31,14 @@ class PlanStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+@dataclass(slots=True)
+class PlanDecision:
+    """What the human decided about a freshly created plan."""
+
+    action: Literal["approve", "cancel", "revise"] = "approve"
+    feedback: str = ""
 
 
 @dataclass(slots=True)
@@ -293,6 +302,10 @@ class ExecutionPlan:
 
     def mark_failed(self) -> None:
         self.status = PlanStatus.FAILED
+        self.end_time = time.time()
+
+    def mark_cancelled(self) -> None:
+        self.status = PlanStatus.CANCELLED
         self.end_time = time.time()
 
     def summarize(self) -> str:
