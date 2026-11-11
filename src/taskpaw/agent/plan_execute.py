@@ -10,7 +10,16 @@ from typing import Any
 from taskpaw.agent.query import query
 from taskpaw.config import TaskPawConfig
 from taskpaw.llm.base import LlmClient
-from taskpaw.plan import ExecutionPlan, PlanDecision, Planner, PlanStatus, Task, TaskStatus
+from taskpaw.plan import (
+    ExecutionPlan,
+    PlanDecision,
+    Planner,
+    PlanStatus,
+    Task,
+    TaskStatus,
+    resources_conflict,
+)
+from taskpaw.plan.store import PlanStore
 from taskpaw.prompt import PromptAssembler
 from taskpaw.skill import SkillContextBuffer
 from taskpaw.snapshot import SnapshotService
@@ -55,6 +64,9 @@ class PlanExecuteAgent:
         self.max_task_turns = max_task_turns
         self.plan_approval_callback = plan_approval_callback
         self.history: list[Message] = []
+        self.store = (
+            PlanStore(max_plans=config.plan.max_history_plans) if config.plan.keep_history else None
+        )
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
         snapshot = SnapshotService(self.cwd)
@@ -64,10 +76,10 @@ class PlanExecuteAgent:
         total_turns = 0
         final_text = ""
         stop_reason = "end_turn"
+        plan: ExecutionPlan | None = None
         try:
             yield {"type": "text_delta", "text": f"正在规划任务：{message}\n\n"}
             yield {"type": "plan_status", "phase": "planning"}
-            plan: ExecutionPlan | None = None
             async for event in self.planner.stream_plan(message):
                 if event.get("type") == "plan_created":
                     plan = event["plan"]
@@ -77,13 +89,32 @@ class PlanExecuteAgent:
                 yield event
             if plan is None:
                 raise ValueError("planner did not produce an execution plan")
+            self._store_start(plan)
+            serialized = plan.auto_serialize_conflicts()
+            if serialized:
+                event = {
+                    "type": "plan_serialized",
+                    "pairs": [
+                        {"earlier": earlier, "later": later} for earlier, later in serialized
+                    ],
+                }
+                self._record(plan.id, event)
+                yield event
+                yield {
+                    "type": "text_delta",
+                    "text": "因资源冲突改为串行："
+                    + "、".join(f"{later} ← {earlier}" for earlier, later in serialized)
+                    + "\n\n",
+                }
             yield {"type": "text_delta", "text": plan.summarize() + "\n\n"}
-            yield {
+            ready_event = {
                 "type": "plan_ready",
                 "plan_id": plan.id,
                 "task_count": len(plan.all_tasks()),
                 "summary": plan.summarize(),
             }
+            self._record(plan.id, ready_event)
+            yield ready_event
 
             cancelled = False
             if self.config.plan.require_approval and self.plan_approval_callback is not None:
@@ -102,11 +133,13 @@ class PlanExecuteAgent:
                         }
                         break
                     revisions += 1
-                    yield {
+                    revision_event = {
                         "type": "plan_revision_started",
                         "attempt": revisions,
                         "feedback": decision.feedback,
                     }
+                    self._record(plan.id, revision_event)
+                    yield revision_event
                     yield {
                         "type": "text_delta",
                         "text": f"按意见重新规划（第 {revisions} 次）……\n\n",
@@ -123,10 +156,12 @@ class PlanExecuteAgent:
                         break
                     total_usage = total_usage + self.planner.last_usage
                     yield {"type": "text_delta", "text": plan.summarize() + "\n\n"}
-                yield {
+                decision_event = {
                     "type": "plan_cancelled" if cancelled else "plan_approved",
                     "plan_id": plan.id,
                 }
+                self._record(plan.id, decision_event)
+                yield decision_event
 
             if cancelled:
                 plan.mark_cancelled()
@@ -139,16 +174,31 @@ class PlanExecuteAgent:
                         total_usage = total_usage + Usage.from_mapping(event.get("usage") or {})
                     elif event.get("type") == "plan_task_done":
                         total_turns += int(event.get("turns") or 0)
+                        self._record(plan.id, event)
+                        task = plan.tasks.get(str(event.get("task_id") or ""))
+                        if task is not None:
+                            self._store_task(
+                                plan.id,
+                                task,
+                                tokens=int(event.get("tokens") or 0),
+                                turns=int(event.get("turns") or 0),
+                            )
                         continue
                     elif event.get("type") == "text_delta":
                         final_text += str(event.get("text") or "")
+                    else:
+                        self._record(plan.id, event)
                     yield event
                 stop_reason = "end_turn" if plan.status == PlanStatus.COMPLETED else "plan_failed"
+            self._store_finish(plan, stop_reason=stop_reason, total_usage=total_usage)
             self.history = [
                 Message(role="user", content=message),
                 Message(role="assistant", content=final_text),
             ]
         except Exception as exc:  # noqa: BLE001
+            if plan is not None:
+                plan.mark_failed()
+                self._store_finish(plan, stop_reason="error", total_usage=total_usage)
             yield {"type": "error", "error": exc}
             return
         finally:
@@ -167,80 +217,145 @@ class PlanExecuteAgent:
             done["cost"] = costs
         yield done
 
+    def _record(self, plan_id: str, event: dict[str, Any]) -> None:
+        if self.store is None:
+            return
+        # History is best effort: a broken database must never break a run.
+        with suppress(Exception):
+            self.store.record_event(plan_id, event)
+
+    def _store_start(self, plan: ExecutionPlan) -> None:
+        if self.store is None:
+            return
+        with suppress(Exception):
+            self.store.start_plan(plan)
+
+    def _store_task(
+        self,
+        plan_id: str,
+        task: Task,
+        *,
+        tokens: int = 0,
+        turns: int = 0,
+    ) -> None:
+        if self.store is None:
+            return
+        with suppress(Exception):
+            self.store.upsert_task(plan_id, task, tokens=tokens, turns=turns)
+
+    def _store_finish(
+        self,
+        plan: ExecutionPlan,
+        *,
+        stop_reason: str,
+        total_usage: Usage,
+    ) -> None:
+        if self.store is None:
+            return
+        with suppress(Exception):
+            self.store.finish_plan(
+                plan,
+                stop_reason=stop_reason,
+                total_tokens=total_usage.total_tokens,
+            )
+
     async def _execute_plan(self, plan: ExecutionPlan) -> AsyncIterator[dict[str, Any]]:
         yield {"type": "text_delta", "text": "开始执行计划……\n\n"}
         yield {"type": "plan_status", "phase": "execution"}
         plan.mark_started()
         repairs = 0
-        while True:
-            executable = _executable_tasks_in_order(plan)
-            if not executable:
-                if plan.has_failed() and repairs < max(0, self.config.plan.max_repairs):
-                    repairs += 1
-                    repaired = False
-                    async for event in self._repair_plan(plan, attempt=repairs):
-                        if event.get("type") == "plan_repair_result":
-                            repaired = bool(event.get("ok"))
-                        else:
-                            yield event
-                    if repaired:
+        max_parallel = max(0, int(self.config.plan.max_parallel_tasks))
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        running: dict[str, asyncio.Task] = {}
+        results: dict[str, TaskRunResult] = {}
+        try:
+            while True:
+                ready = _executable_tasks_in_order(plan)
+                if not ready and not running:
+                    if plan.has_failed() and repairs < max(0, self.config.plan.max_repairs):
+                        repairs += 1
+                        repaired = False
+                        async for event in self._repair_plan(plan, attempt=repairs):
+                            if event.get("type") == "plan_repair_result":
+                                repaired = bool(event.get("ok"))
+                            else:
+                                yield event
+                        if repaired:
+                            continue
+                    break
+
+                in_flight: set[str] = set()
+                for task_id in running:
+                    in_flight |= plan.tasks[task_id].effective_resources()
+                admitted: list[str] = []
+                for task in ready:
+                    if max_parallel and len(running) >= max_parallel:
+                        break
+                    if task.id in running:
                         continue
-                break
-
-            if len(executable) == 1:
-                result: TaskRunResult | None = None
-                async for event in self._execute_task_stream(plan, executable[0]):
-                    if event.get("type") == "plan_task_result":
-                        result = event["result"]
-                    else:
-                        yield event
-                if result is None:
-                    raise RuntimeError(f"task {executable[0].id} did not produce a result")
-                async for event in self._apply_task_result(result):
-                    yield event
-                continue
-
-            yield {
-                "type": "text_delta",
-                "text": (f"正在并行执行：{', '.join(task.id for task in executable)}\n\n"),
-            }
-            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-            runners = [
-                asyncio.create_task(self._pump_task_events(plan, task, queue))
-                for task in executable
-            ]
-            results: dict[str, TaskRunResult] = {}
-            finished = 0
-            try:
-                while finished < len(runners):
-                    event = await queue.get()
-                    event_type = event.get("type")
-                    if event_type == "plan_task_stream_done":
-                        finished += 1
-                    elif event_type == "plan_task_result":
-                        result = event["result"]
-                        results[result.task.id] = result
-                    else:
-                        yield event
-            finally:
-                if finished < len(runners):
-                    for runner in runners:
-                        if not runner.done():
-                            runner.cancel()
-                await asyncio.gather(*runners, return_exceptions=True)
-
-            for task in executable:
-                result = results.get(task.id)
-                if result is None:
-                    result = TaskRunResult(
-                        task=task,
-                        text="",
-                        usage=Usage(),
-                        turns=0,
-                        error=RuntimeError(f"task {task.id} did not produce a result"),
+                    if resources_conflict(task.effective_resources(), in_flight):
+                        continue
+                    running[task.id] = asyncio.create_task(
+                        self._pump_task_events(plan, task, queue)
                     )
-                async for event in self._apply_task_result(result):
+                    in_flight |= task.effective_resources()
+                    admitted.append(task.id)
+
+                if admitted:
+                    yield {
+                        "type": "plan_schedule",
+                        "limit": max_parallel,
+                        "running": len(running),
+                        "started": admitted,
+                    }
+                    if len(admitted) > 1:
+                        yield {
+                            "type": "text_delta",
+                            "text": (
+                                f"并行执行（{len(running)}/{max_parallel or '∞'}）："
+                                f"{', '.join(admitted)}\n\n"
+                            ),
+                        }
+                    else:
+                        yield {
+                            "type": "text_delta",
+                            "text": f"执行 [{admitted[0]}]……\n\n",
+                        }
+
+                if not running:
+                    break
+
+                event = await queue.get()
+                event_type = event.get("type")
+                if event_type == "plan_task_stream_done":
+                    task_id = str(event.get("task_id") or "")
+                    runner = running.pop(task_id, None)
+                    if runner is not None:
+                        await asyncio.gather(runner, return_exceptions=True)
+                    result = results.pop(task_id, None)
+                    if result is None:
+                        task = plan.tasks.get(task_id)
+                        if task is not None and task.status == TaskStatus.RUNNING:
+                            result = TaskRunResult(
+                                task=task,
+                                text="",
+                                usage=Usage(),
+                                turns=0,
+                                error=RuntimeError(f"task {task_id} produced no result"),
+                            )
+                    if result is not None:
+                        async for applied in self._apply_task_result(result):
+                            yield applied
+                elif event_type == "plan_task_result":
+                    result = event["result"]
+                    results[result.task.id] = result
+                else:
                     yield event
+        finally:
+            for runner in running.values():
+                if not runner.done():
+                    runner.cancel()
+            await asyncio.gather(*running.values(), return_exceptions=True)
 
         skipped = plan.skip_blocked()
         if skipped:

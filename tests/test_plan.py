@@ -63,6 +63,7 @@ def test_planner_parses_tasks_and_dependencies():
 
 def test_plan_execute_runs_independent_tasks_in_parallel(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     client = ParallelPlanClient()
     registry = ToolRegistry()
     registry.register_all(get_builtin_tools())

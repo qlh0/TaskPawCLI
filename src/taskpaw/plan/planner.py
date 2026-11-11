@@ -19,11 +19,16 @@ PLANNER_PROMPT = """你是 TaskPaw 的任务规划器。
       "id": "stable_source_id",
       "description": "concrete executable step",
       "type": "FILE_READ|FILE_WRITE|COMMAND|ANALYSIS|VERIFICATION",
+      "resources": ["file:src/main.py"],
       "dependencies": ["stable_source_id"]
     }
   ]
 }
 可以并行的独立任务应放在同一执行批次中。
+resources 声明该任务会写入/影响的范围：
+file:<path>、dir:<path>、workspace、service:<name>。
+会写同一个文件的任务不要并行：要么合并，要么显式加 dependencies。
+只读任务（FILE_READ / ANALYSIS / VERIFICATION）可以省略 resources。
 summary 和 description 必须使用与用户目标相同的语言；用户目标包含中文时，必须使用中文。
 JSON 字段名、任务 id 和 type 枚举值保持上述英文格式。
 """
@@ -38,12 +43,14 @@ REPAIR_PROMPT = """你是 TaskPaw 的局部修复规划器。
       "id": "repair_1",
       "description": "concrete executable step",
       "type": "FILE_READ|FILE_WRITE|COMMAND|ANALYSIS|VERIFICATION",
+      "resources": ["file:src/main.py"],
       "dependencies": ["task_1"]
     }
   ]
 }
 规则：
 - dependencies 只能引用「已完成任务的 id」或本次返回的新 id；
+- resources 用 file:<path> / dir:<path> / workspace / service:<name> 声明会被写入的范围；
 - 不要重复已完成任务的工作，可以直接利用它们的结果；
 - 如果失败原因是外部条件（权限、文件不存在、依赖缺失），给出可执行的替代方案；
 - description 必须使用与用户目标相同的语言。
@@ -137,6 +144,7 @@ class Planner:
                 dependencies=[str(dep) for dep in dependencies]
                 if isinstance(dependencies, list)
                 else [],
+                resources=_parse_resources(node.get("resources")),
             )
             if task.description:
                 tasks.append(task)
@@ -163,6 +171,7 @@ class Planner:
                     id=new_id,
                     description=str(node.get("description") or original_id),
                     type=_parse_task_type(str(node.get("type") or "ANALYSIS")),
+                    resources=_parse_resources(node.get("resources")),
                 )
             )
 
@@ -274,6 +283,14 @@ def _parse_task_type(value: str) -> TaskType:
         return TaskType(normalized)
     except ValueError:
         return TaskType.ANALYSIS
+
+
+def _parse_resources(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
 
 
 def _is_simple_goal(goal: str | None) -> bool:

@@ -34,6 +34,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from taskpaw import __version__
 from taskpaw.agent import QueryEngine
@@ -42,6 +43,7 @@ from taskpaw.config import get_config_paths, load_config
 from taskpaw.entrypoints.repl import start_repl
 from taskpaw.llm import create_llm_client
 from taskpaw.mcp import load_mcp_server_specs, serve_http, serve_stdio, write_chrome_devtools_config
+from taskpaw.plan.store import PlanStore
 from taskpaw.runtime import RuntimeApiServer
 from taskpaw.runtime.api import runtime_api_key
 
@@ -53,6 +55,8 @@ app = typer.Typer(
 )
 mcp_app = typer.Typer(help="MCP server management")
 app.add_typer(mcp_app, name="mcp")
+plan_app = typer.Typer(help="Inspect stored Plan-mode history")
+app.add_typer(plan_app, name="plan")
 console = Console()
 
 
@@ -387,3 +391,99 @@ def _version_of(command: str) -> str:
     except Exception:  # noqa: BLE001
         return "unknown"
     return (result.stdout or result.stderr).strip() or "unknown"
+
+
+# ---------------------------------------------------------------------------
+# plan subcommands — inspect stored Plan-mode history
+# ---------------------------------------------------------------------------
+
+
+@plan_app.command("list")
+def plan_list(
+    limit: Annotated[int, typer.Option("--limit", help="How many plans to show")] = 20,
+) -> None:
+    """List recently stored plans."""
+    plans = PlanStore().list_plans(limit=limit)
+    if not plans:
+        typer.echo("(no plans recorded yet)")
+        return
+    table = Table(title="Plans")
+    table.add_column("plan_id")
+    table.add_column("status")
+    table.add_column("tasks", justify="right")
+    table.add_column("tokens", justify="right")
+    table.add_column("stop_reason")
+    table.add_column("created")
+    table.add_column("goal", overflow="fold")
+    for plan in plans:
+        table.add_row(
+            str(plan.get("plan_id")),
+            str(plan.get("status")),
+            str(plan.get("task_count") or 0),
+            str(plan.get("total_tokens") or 0),
+            str(plan.get("stop_reason") or "-"),
+            str(plan.get("created_at") or "")[:19].replace("T", " "),
+            str(plan.get("goal") or ""),
+        )
+    console.print(table)
+
+
+@plan_app.command("show")
+def plan_show(
+    plan_id: Annotated[str, typer.Argument(help="Plan id from `taskpaw plan list`")],
+) -> None:
+    """Show one plan and its task results."""
+    plan = PlanStore().get_plan(plan_id)
+    if not plan:
+        typer.echo(f"plan not found: {plan_id}", err=True)
+        raise typer.Exit(1)
+
+    console.print(
+        f"[bold]{plan['plan_id']}[/bold] · {plan['status']}"
+        f" · stop_reason={plan.get('stop_reason') or '-'}"
+        f" · tokens={plan.get('total_tokens') or 0}"
+    )
+    console.print(f"目标：{plan.get('goal') or ''}\n")
+
+    table = Table(title="Tasks")
+    table.add_column("task")
+    table.add_column("status")
+    table.add_column("tries", justify="right")
+    table.add_column("tokens", justify="right")
+    table.add_column("description", overflow="fold")
+    table.add_column("detail", overflow="fold")
+    for task in plan.get("tasks") or []:
+        detail = task.get("error") or task.get("result_preview") or ""
+        table.add_row(
+            str(task.get("task_id")),
+            str(task.get("status")),
+            str(task.get("attempts") or 0),
+            str(task.get("tokens") or 0),
+            str(task.get("description") or ""),
+            str(detail)[:200],
+        )
+    console.print(table)
+
+
+@plan_app.command("events")
+def plan_events(
+    plan_id: Annotated[str, typer.Argument(help="Plan id from `taskpaw plan list`")],
+    task: Annotated[str | None, typer.Option("--task", help="Filter by task id")] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Max events to show")] = 100,
+) -> None:
+    """Print the event timeline of one plan."""
+    events = PlanStore().list_events(plan_id, task_id=task, limit=limit)
+    if not events:
+        typer.echo(f"(no events for {plan_id})")
+        return
+    for event in events:
+        payload = json.dumps(event.get("payload") or {}, ensure_ascii=False)
+        if len(payload) > 200:
+            payload = payload[:197] + "..."
+        when = str(event.get("created_at") or "")[11:19]
+        task_id = str(event.get("task_id") or "-")
+        console.print(
+            f"{when} [{event.get('type')}] task={task_id} {payload}",
+            markup=False,
+            highlight=False,
+        )

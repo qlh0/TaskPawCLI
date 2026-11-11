@@ -5,6 +5,8 @@ from taskpaw.plan.models import (
     Task,
     TaskStatus,
     TaskType,
+    normalize_resource,
+    resources_conflict,
 )
 from taskpaw.plan.planner import Planner
 
@@ -16,4 +18,6 @@ __all__ = [
     "Task",
     "TaskStatus",
     "TaskType",
+    "normalize_resource",
+    "resources_conflict",
 ]

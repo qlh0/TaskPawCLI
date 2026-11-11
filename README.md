@@ -274,7 +274,6 @@ ReAct 循环由 `LoopGuard` 守护，避免死循环、空转和静默截断：
 审批回调时生效——REPL 已内置；`-p` 等非交互路径默认不拦截，通过 SDK 调用时可以自行传入回调。
 
 **失败梯度**：失败不是"一失败就结束"，而是：
-
 1. **子任务重试**：失败后带着上一次的错误原因重试，默认最多 3 次；预算耗尽、权限拒绝
    这类确定性失败不会重试。
 2. **局部重规划**：重试仍失败时，只把「失败任务 + 它的下游」这一段交给规划器重写，
@@ -294,9 +293,41 @@ ReAct 循环由 `LoopGuard` 守护，避免死循环、空转和静默截断：
     "max_task_retries": 3,
     "max_repairs": 1,
     "require_approval": false,
-    "max_plan_revisions": 2
+    "max_plan_revisions": 2,
+    "max_parallel_tasks": 4,
+    "keep_history": true,
+    "max_history_plans": 50
   }
 }
+```
+
+## Plan 模式：并行调度与写冲突
+
+规划器会为每个任务声明它会写入/影响的范围（`resources`）：
+
+```json
+{"id": "task_2", "type": "FILE_WRITE", "resources": ["file:src/cli.py"], "dependencies": []}
+```
+
+支持的取值：`file:<path>`、`dir:<path>`、`workspace`（整个工作区独占）、`service:<name>`。
+只读任务可以省略。没声明资源的写任务和命令任务会保守地按 `workspace` 处理。
+
+调度规则：
+
+- **写冲突自动串行**：两个任务资源重叠（含"一个写、一个读同一文件"）时，计划会自动补一条依赖边，
+  摘要里会显示 `因资源冲突改为串行：task_2 ← task_1`；
+- **并发上限**：`max_parallel_tasks` 控制同时运行的子任务数（默认 4，`0` 表示不限，`1` 表示串行）；
+- **不阻塞等待**：调度器只在任务入场时检查资源，不会让运行中的任务等锁，因此不存在死锁。
+
+## Plan 历史：list / show / events
+
+每次 Plan 运行都会把计划、任务状态和关键事件写入 `~/.taskpaw/plans.db`（可用
+`plan.keep_history=false` 关闭，`max_history_plans` 控制保留条数）：
+
+```bash
+taskpaw plan list                 # 最近的计划：状态 / 任务数 / token / 终止原因
+taskpaw plan show <plan_id>       # 每个任务的状态、尝试次数、失败原因
+taskpaw plan events <plan_id> --task task_2   # 事件时间线
 ```
 
 ## 模型、Token 与费用

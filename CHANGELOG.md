@@ -8,9 +8,15 @@
   （默认最多 2 次），取消则一个任务都不执行且 `stop_reason=plan_cancelled`。
 - Plan 模式失败梯度：子任务重试（默认 3 次，预算耗尽/权限拒绝等确定性失败不重试）→
   失败子图局部重规划（默认 1 次）→ 依赖级联跳过 → 如实汇报。
-- 新增 `plan` 配置段：`max_task_retries`、`max_repairs`、`require_approval`、`max_plan_revisions`。
+- 资源感知调度：规划器为任务声明 `resources`（file/dir/workspace/service），
+  写冲突自动补依赖边转为串行；`plan.max_parallel_tasks` 限制并发（0 不限，1 串行）。
+- Plan 历史持久化：`~/.taskpaw/plans.db` 记录计划、任务状态与关键事件，
+  新增 `taskpaw plan list|show|events`。
+- 新增 `plan` 配置段：`max_task_retries`、`max_repairs`、`require_approval`、
+  `max_plan_revisions`、`max_parallel_tasks`、`keep_history`、`max_history_plans`。
 - 新事件：`plan_ready`、`plan_approved`、`plan_cancelled`、`plan_revision_started`、
-  `plan_task_retry`、`plan_repair_started`、`plan_repair_result`、`plan_repaired`。
+  `plan_serialized`、`plan_schedule`、`plan_task_retry`、`plan_repair_started`、
+  `plan_repair_result`、`plan_repaired`。
 
 ### Fixed
 

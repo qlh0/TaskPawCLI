@@ -141,6 +141,11 @@ class PlanConfig:
     require_approval: bool = False
     # How many times the human may ask for the plan to be rewritten.
     max_plan_revisions: int = 2
+    # How many subtasks may run at the same time. 0 means unlimited, 1 means serial.
+    max_parallel_tasks: int = 4
+    # Persist plans/tasks/events for `taskpaw plan list|show|events`.
+    keep_history: bool = True
+    max_history_plans: int = 50
 
 
 @dataclass(slots=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -15,6 +16,11 @@ class TaskType(StrEnum):
     COMMAND = "COMMAND"
     ANALYSIS = "ANALYSIS"
     VERIFICATION = "VERIFICATION"
+
+
+_READ_ONLY_TYPES = frozenset(
+    {TaskType.FILE_READ, TaskType.ANALYSIS, TaskType.VERIFICATION, TaskType.PLANNING}
+)
 
 
 class TaskStatus(StrEnum):
@@ -54,6 +60,21 @@ class Task:
     start_time: float = 0.0
     end_time: float = 0.0
     attempts: int = 0
+    resources: list[str] = field(default_factory=list)
+
+    def effective_resources(self) -> set[str]:
+        """Normalised resources this task may touch.
+
+        Tasks that do not declare anything fall back to a conservative default:
+        read-only task types use nothing, writers and commands lock the whole
+        workspace.
+        """
+
+        if self.resources:
+            return normalize_resources(self.resources)
+        if self.type in _READ_ONLY_TYPES:
+            return set()
+        return {"workspace"}
 
     def add_dependency(self, task_id: str) -> None:
         if task_id not in self.dependencies:
@@ -194,6 +215,32 @@ class ExecutionPlan:
     def has_failed(self) -> bool:
         return any(task.status == TaskStatus.FAILED for task in self.tasks.values())
 
+    def auto_serialize_conflicts(self) -> list[tuple[str, str]]:
+        """Add dependency edges between tasks that declare overlapping resources.
+
+        Edges always point forward in the current execution order, so the DAG
+        stays acyclic. Returns the (earlier, later) pairs that were serialised.
+        """
+
+        order = self.execution_order()
+        tasks = [self.tasks[task_id] for task_id in order if task_id in self.tasks]
+        added: list[tuple[str, str]] = []
+        for index, earlier in enumerate(tasks):
+            for later in tasks[index + 1 :]:
+                if later.id in self.descendants([earlier.id]):
+                    continue
+                if not resources_conflict(
+                    earlier.effective_resources(), later.effective_resources()
+                ):
+                    continue
+                later.add_dependency(earlier.id)
+                earlier.add_dependent(later.id)
+                added.append((earlier.id, later.id))
+        if added:
+            self._execution_order.clear()
+            self.compute_execution_order()
+        return added
+
     def status_counts(self) -> dict[str, int]:
         counts = {status.value: 0 for status in TaskStatus}
         for task in self.tasks.values():
@@ -319,3 +366,70 @@ class ExecutionPlan:
             f"首批任务：{first_batch}\n"
             f"最终汇总：{final_batch}"
         )
+
+
+def normalize_resource(token: str) -> str:
+    """Normalise a declared resource token into ``kind:value`` form."""
+
+    raw = str(token or "").strip()
+    if not raw:
+        return ""
+    if raw.lower() in {"workspace", "*", "all"}:
+        return "workspace"
+    if ":" in raw:
+        kind, _, value = raw.partition(":")
+        kind = kind.strip().lower()
+        value = value.strip()
+    else:
+        kind, value = "file", raw
+    if kind not in {"file", "dir", "service"}:
+        kind, value = "file", f"{kind}:{value}"
+    if kind == "service":
+        return f"service:{value.lower()}"
+    if not value:
+        return ""
+    normalized = os.path.normcase(os.path.normpath(value)).replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    if kind == "dir" and not normalized.endswith("/"):
+        normalized += "/"
+    return f"{kind}:{normalized}"
+
+
+def normalize_resources(tokens: Iterable[str]) -> set[str]:
+    normalized: set[str] = set()
+    for token in tokens:
+        value = normalize_resource(token)
+        if value:
+            normalized.add(value)
+    return normalized
+
+
+def resources_conflict(left: set[str], right: set[str]) -> bool:
+    """True when two tasks must not run at the same time."""
+
+    if not left or not right:
+        return False
+    if "workspace" in left or "workspace" in right:
+        return True
+    for first in left:
+        for second in right:
+            if first == second:
+                return True
+            if first.startswith("dir:"):
+                prefix = first[4:]
+                if second.startswith("file:") and _within(second[5:], prefix):
+                    return True
+                if second.startswith("dir:") and _within(second[4:], prefix):
+                    return True
+            if second.startswith("dir:"):
+                prefix = second[4:]
+                if first.startswith("dir:") and _within(first[4:], prefix):
+                    return True
+                if first.startswith("file:") and _within(first[5:], prefix):
+                    return True
+    return False
+
+
+def _within(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(directory)
