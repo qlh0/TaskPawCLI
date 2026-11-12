@@ -4,6 +4,8 @@
 
 ### Added
 
+- 两级渐进式上下文压缩：先清理旧工具结果（保留消息与 `tool_call_id`，最近 N 轮与过小结果不动），
+  仍超预算才摘要旧对话；`context_compressed` 事件新增 `stage` 与 `cleared_tool_results`。
 - Plan 审批门：REPL 在规划完成后先确认（执行 / 取消 / 提修改意见），修改意见会触发重新规划
   （默认最多 2 次），取消则一个任务都不执行且 `stop_reason=plan_cancelled`。
 - Plan 模式失败梯度：子任务重试（默认 3 次，预算耗尽/权限拒绝等确定性失败不重试）→

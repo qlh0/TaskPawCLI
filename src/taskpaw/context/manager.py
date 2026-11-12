@@ -7,6 +7,10 @@ from dataclasses import dataclass
 
 from taskpaw.types import Message
 
+# Placeholder that replaces cleared tool output. Tool messages themselves are kept
+# because every assistant tool_call must still own a matching tool result.
+CLEARED_TOOL_RESULT = "[old tool result cleared to save context]"
+
 
 @dataclass(slots=True, frozen=True)
 class ContextBudget:
@@ -37,15 +41,21 @@ class CompressionResult:
     estimated_tokens_after: int
     compressed: bool
     summarized_messages: int = 0
+    # none | tool_results | summary | summary_shrink
+    stage: str = "none"
+    cleared_tool_results: int = 0
 
 
 class ContextWindowManager:
     """Keep a conversation inside the model budget without breaking recent tool turns.
 
-    The compressor is deliberately deterministic. It creates an extractive rolling summary of
-    older turns, keeps recent turns verbatim, and only truncates oversized tool payloads as a
-    final safety valve. The summary remains short-term session state and is never written to
-    long-term memory automatically.
+    Compression is progressive and deterministic:
+
+    1. clear the content of old tool results (cheap, no model call) while keeping
+       the tool message and its ``tool_call_id`` so the protocol stays valid;
+    2. only if that is not enough, replace the older conversation with an
+       extractive rolling summary and keep recent turns verbatim;
+    3. oversized payloads in the retained window are truncated as a last resort.
     """
 
     def __init__(
@@ -56,12 +66,18 @@ class ContextWindowManager:
         min_recent_messages: int = 6,
         summary_max_chars: int = 6000,
         tool_result_max_chars: int = 4000,
+        tool_result_clear_enabled: bool = True,
+        tool_result_keep_rounds: int = 2,
+        tool_result_min_chars: int = 120,
     ):
         self.budget = budget
         self.max_history_messages = max(2, max_history_messages)
         self.min_recent_messages = max(2, min_recent_messages)
         self.summary_max_chars = max(256, summary_max_chars)
         self.tool_result_max_chars = max(256, tool_result_max_chars)
+        self.tool_result_clear_enabled = tool_result_clear_enabled
+        self.tool_result_keep_rounds = max(0, tool_result_keep_rounds)
+        self.tool_result_min_chars = max(0, tool_result_min_chars)
 
     def prepare(
         self,
@@ -70,7 +86,8 @@ class ContextWindowManager:
         system_prompt: str = "",
         tool_definitions: list[dict] | None = None,
     ) -> CompressionResult:
-        before = self._estimate_request(messages, system_prompt, tool_definitions or [])
+        definitions = tool_definitions or []
+        before = self._estimate_request(messages, system_prompt, definitions)
         over_message_limit = len(messages) > self.max_history_messages
         if before <= self.budget.compression_limit and not over_message_limit:
             return CompressionResult(list(messages), before, before, False)
@@ -80,12 +97,43 @@ class ContextWindowManager:
             split_at = max(split_at, len(messages) - self.max_history_messages)
             split_at = self._align_boundary(messages, split_at)
 
-        older = messages[:split_at]
-        recent = [_copy_message(message) for message in messages[split_at:]]
+        working = list(messages)
+        cleared_count = 0
+        stage = "none"
+
+        # Stage 1: clear old tool results. Only pay for a summary when this is not enough.
+        if self.tool_result_clear_enabled and before > self.budget.compression_limit:
+            protect_from = self._protect_from(messages, self.tool_result_keep_rounds)
+            clear_before = min(split_at, protect_from)
+            working, cleared_count = self._clear_old_tool_results(
+                messages,
+                clear_before,
+                system_prompt=system_prompt,
+                tool_definitions=definitions,
+            )
+            if cleared_count:
+                stage = "tool_results"
+                stage_after = self._estimate_request(working, system_prompt, definitions)
+                if stage_after <= self.budget.compression_target_tokens and not over_message_limit:
+                    return CompressionResult(
+                        working,
+                        before,
+                        stage_after,
+                        True,
+                        stage=stage,
+                        cleared_tool_results=cleared_count,
+                    )
+
+        older = working[:split_at]
+        recent = [_copy_message(message) for message in working[split_at:]]
         if not older and len(messages) > 1:
             split_at = self._align_boundary(messages, max(1, len(messages) // 2))
-            older = messages[:split_at]
-            recent = [_copy_message(message) for message in messages[split_at:]]
+            older = working[:split_at]
+            recent = [_copy_message(message) for message in working[split_at:]]
+        if not older and cleared_count == 0:
+            # Nothing can be removed (for example only a user message plus a large
+            # system prompt); report no compression instead of a no-op event.
+            return CompressionResult(list(messages), before, before, False)
 
         compacted: list[Message] = []
         if older:
@@ -94,11 +142,13 @@ class ContextWindowManager:
             )
         compacted.extend(recent)
         compacted = self._truncate_tool_payloads(compacted)
+        stage = "summary"
 
-        after = self._estimate_request(compacted, system_prompt, tool_definitions or [])
+        after = self._estimate_request(compacted, system_prompt, definitions)
         if after > self.budget.compression_target_tokens and compacted:
-            compacted = self._shrink_summary(compacted, system_prompt, tool_definitions or [])
-            after = self._estimate_request(compacted, system_prompt, tool_definitions or [])
+            compacted = self._shrink_summary(compacted, system_prompt, definitions)
+            after = self._estimate_request(compacted, system_prompt, definitions)
+            stage = "summary_shrink"
 
         return CompressionResult(
             compacted,
@@ -106,7 +156,59 @@ class ContextWindowManager:
             after,
             True,
             summarized_messages=len(older),
+            stage=stage,
+            cleared_tool_results=cleared_count,
         )
+
+    def _protect_from(self, messages: list[Message], keep_rounds: int) -> int:
+        """Start index of the last *keep_rounds* assistant tool-call rounds."""
+
+        if keep_rounds <= 0:
+            return 0
+        seen = 0
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.role == "assistant" and message.tool_calls:
+                seen += 1
+                if seen >= keep_rounds:
+                    return index
+        return 0
+
+    def _clear_old_tool_results(
+        self,
+        messages: list[Message],
+        end: int,
+        *,
+        system_prompt: str,
+        tool_definitions: list[dict],
+    ) -> tuple[list[Message], int]:
+        """Replace old tool results with a placeholder until the target budget is met."""
+
+        working = [_copy_message(message) for message in messages]
+        fixed_tokens = self._estimate_request([], system_prompt, tool_definitions)
+        total = fixed_tokens + sum(estimate_message_tokens(message) for message in working)
+        target = self.budget.compression_target_tokens
+        cleared = 0
+
+        for index in range(max(0, min(end, len(working)))):
+            message = working[index]
+            if message.role != "tool":
+                continue
+            content = message.content
+            if isinstance(content, str):
+                if content.startswith(CLEARED_TOOL_RESULT) or content.strip() == "":
+                    continue
+                if len(content) < self.tool_result_min_chars:
+                    continue
+
+            before_tokens = estimate_message_tokens(message)
+            message.content = CLEARED_TOOL_RESULT
+            after_tokens = estimate_message_tokens(message)
+            total -= max(0, before_tokens - after_tokens)
+            cleared += 1
+            if total <= target:
+                break
+        return working, cleared
 
     def _recent_boundary(self, messages: list[Message]) -> int:
         if len(messages) <= self.min_recent_messages:
@@ -117,15 +219,20 @@ class ContextWindowManager:
     @staticmethod
     def _align_boundary(messages: list[Message], candidate: int) -> int:
         candidate = min(max(candidate, 0), len(messages))
-        # Prefer starting the retained slice at a user turn. This keeps an assistant tool call
-        # and all of its tool results on the same side of the compression boundary.
-        for index in range(candidate, -1, -1):
-            if index < len(messages) and messages[index].role == "user":
-                return index
-        for index in range(candidate, len(messages)):
+        # Prefer starting the retained slice at a user turn, but never collapse the
+        # whole conversation into a single summary just because the only user turn
+        # is the first message: long ReAct loops have one user turn and many tool
+        # rounds, and that is exactly when compression is needed.
+        for index in range(candidate, 0, -1):
             if messages[index].role == "user":
                 return index
-        return candidate
+        # Otherwise keep assistant tool calls and their results on the same side:
+        # never start the retained slice on an orphaned tool message. Moving
+        # backwards keeps the most recent tool round intact.
+        index = candidate
+        while index > 0 and messages[index].role == "tool":
+            index -= 1
+        return index
 
     def _summarize(self, messages: list[Message], max_chars: int) -> str:
         lines = [
@@ -136,6 +243,8 @@ class ContextWindowManager:
         per_message = max(80, min(500, max_chars // max(1, len(messages))))
         for message in messages:
             text = _message_text(message)
+            if text.strip() == CLEARED_TOOL_RESULT:
+                continue
             text = re.sub(r"\s+", " ", text).strip()
             if not text and message.tool_calls:
                 text = json.dumps(message.tool_calls, ensure_ascii=False)

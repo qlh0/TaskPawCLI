@@ -58,6 +58,10 @@ class MemoryConfig:
     compression_reserve_tokens: int = 1_024
     min_recent_messages: int = 6
     summary_max_chars: int = 6_000
+    # Progressive compression: clear old tool results before summarizing.
+    tool_result_clear_enabled: bool = True
+    tool_result_keep_rounds: int = 2
+    tool_result_min_chars: int = 120
 
 
 @dataclass(slots=True)

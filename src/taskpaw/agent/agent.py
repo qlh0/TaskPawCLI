@@ -124,7 +124,7 @@ class Agent:
             {"type": "turn_complete", "turn": int, "stop_reason": str}
         ``context_compressed``
             {"type": "context_compressed", "before_tokens": ..., "after_tokens": ...,
-             "summarized_messages": int}
+             "summarized_messages": int, "stage": str, "cleared_tool_results": int}
         ``error``
             {"type": "error", "error": Exception}
         ``done``

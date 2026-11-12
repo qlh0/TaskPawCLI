@@ -71,6 +71,9 @@ async def query(
         max_history_messages=config.memory.max_conversation_history,
         min_recent_messages=config.memory.min_recent_messages,
         summary_max_chars=config.memory.summary_max_chars,
+        tool_result_clear_enabled=config.memory.tool_result_clear_enabled,
+        tool_result_keep_rounds=config.memory.tool_result_keep_rounds,
+        tool_result_min_chars=config.memory.tool_result_min_chars,
     )
 
     total_usage = Usage()
@@ -105,6 +108,8 @@ async def query(
                     "before_tokens": compression.estimated_tokens_before,
                     "after_tokens": compression.estimated_tokens_after,
                     "summarized_messages": compression.summarized_messages,
+                    "stage": compression.stage,
+                    "cleared_tool_results": compression.cleared_tool_results,
                 }
 
         async for event in llm_client.chat(

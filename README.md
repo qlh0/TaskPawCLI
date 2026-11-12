@@ -225,7 +225,29 @@ TaskPaw 把记忆分成三层：
 
 Prompt 分为可缓存的静态前缀和逐请求重建的动态后缀。静态前缀承载身份、规则和项目指令；动态后缀承载当前时间、cwd、模型、工具以及与当前问题相关的记忆。
 
-可用输入预算按 `context_window - max_output_tokens - reserve_tokens` 计算。默认在该预算的 80% 触发压缩，压到 55% 左右，为后续输出、工具结果和无 tokenizer 估算误差留出空间。压缩摘要只属于短期会话，不会自动晋升为长期记忆。
+可用输入预算按 `context_window - max_output_tokens - reserve_tokens` 计算。默认在该预算的 80% 触发压缩，分两级渐进进行：
+
+1. **清理旧工具结果**：把较早的工具输出替换成占位符（保留消息本体与 `tool_call_id`，协议关系不变），
+   最近 `tool_result_keep_rounds` 轮工具交互、以及小于 `tool_result_min_chars` 的结果不动；
+   清到目标预算即停止，**不消耗额外模型调用**。
+2. **摘要旧对话**：只有清理后仍超预算，才沿用 `_summarize()` 把更早的对话压成一条滚动摘要，
+   仍超目标时再压缩摘要长度。
+
+压缩摘要只属于短期会话，不会自动晋升为长期记忆。
+
+相关配置在 `memory` 段：
+
+```json
+{
+  "memory": {
+    "compression_threshold": 0.8,
+    "compression_target": 0.55,
+    "tool_result_clear_enabled": true,
+    "tool_result_keep_rounds": 2,
+    "tool_result_min_chars": 120
+  }
+}
+```
 
 ## 循环保护
 
