@@ -4,6 +4,8 @@
 
 ### Added
 
+- 长期记忆支持按 id 原地更新：新增 `update_memory` 工具与 `MemoryManager.update()`，
+  保留原 id/创建时间，内容哈希冲突时自动合并重复行；用户表达修正意图时提示模型先搜后改。
 - 两级渐进式上下文压缩：先清理旧工具结果（保留消息与 `tool_call_id`，最近 N 轮与过小结果不动），
   仍超预算才摘要旧对话；`context_compressed` 事件新增 `stage` 与 `cleared_tool_results`。
 - Plan 审批门：REPL 在规划完成后先确认（执行 / 取消 / 提修改意见），修改意见会触发重新规划

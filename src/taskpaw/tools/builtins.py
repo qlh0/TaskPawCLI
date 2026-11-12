@@ -4,7 +4,7 @@ import asyncio
 import os
 from typing import Any
 
-from taskpaw.memory import MemoryManager
+from taskpaw.memory import MemoryManager, MemoryNotFoundError, MemoryScopeError
 from taskpaw.policy import CommandGuard
 from taskpaw.rag import CodeIndex
 from taskpaw.skill import SkillRegistry
@@ -271,6 +271,40 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["content"],
             handler=_save_memory,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
+        ),
+        Tool(
+            name="update_memory",
+            description=(
+                "Rewrite an existing long-term memory by id. Use it when the user corrects or "
+                "replaces an earlier fact (for example 改为 / 不再使用 / 之前说错了): "
+                "search_memory first to find the target id, then update it instead of "
+                "saving a duplicate."
+            ),
+            parameters=object_schema(
+                {
+                    "memory_id": {
+                        "type": "integer",
+                        "description": "Memory id shown by search_memory",
+                    },
+                    "content": {"type": "string", "description": "New durable content"},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "preference", "constraint", "correction", "decision"],
+                    },
+                    "importance": {"type": "number", "description": "Score from 0 to 1"},
+                    "confidence": {"type": "number", "description": "Score from 0 to 1"},
+                    "expires_at": {
+                        "type": "string",
+                        "description": "Optional ISO-8601 expiry; pass an empty string to clear it",
+                    },
+                },
+                ["memory_id", "content"],
+            ),
+            required_keys=["memory_id", "content"],
+            handler=_update_memory,
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="medium",
@@ -551,6 +585,41 @@ async def _save_memory(payload: dict[str, Any], context: ToolContext) -> ToolRes
     return ToolResult(f"Saved memory #{memory_id}")
 
 
+async def _update_memory(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    if not context.config.features.memory or not context.config.memory.long_term_enabled:
+        return ToolResult("Long-term memory is disabled.", is_error=True)
+    try:
+        memory_id = int(payload["memory_id"])
+    except (TypeError, ValueError):
+        return ToolResult("update_memory memory_id must be an integer", is_error=True)
+    manager = MemoryManager(
+        context.config.memory.long_term_db_path,
+        scope=context.cwd,
+        max_entries=context.config.memory.max_long_term_entries,
+        max_content_length=context.config.memory.max_memory_chars,
+    )
+    try:
+        entry, merged = manager.update(
+            memory_id,
+            str(payload["content"]),
+            kind=str(payload["kind"]) if payload.get("kind") is not None else None,
+            source="agent",
+            importance=payload.get("importance"),
+            confidence=payload.get("confidence"),
+            expires_at=payload.get("expires_at"),
+        )
+    except (MemoryNotFoundError, MemoryScopeError, ValueError, TypeError) as exc:
+        return ToolResult(f"update_memory failed: {exc}", is_error=True)
+
+    summary = (
+        f"Updated memory #{entry.id}（{entry.kind}, importance={entry.importance:.2f}）："
+        f"{entry.content}"
+    )
+    if merged:
+        summary += "\n合并了重复记忆：" + ", ".join(f"#{merged_id}" for merged_id in merged)
+    return ToolResult(summary, display_summary=f"Updated memory #{entry.id}")
+
+
 async def _search_memory(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     if not context.config.features.memory or not context.config.memory.long_term_enabled:
         return ToolResult("Long-term memory is disabled.", is_error=True)
@@ -579,6 +648,7 @@ async def _search_memory(payload: dict[str, Any], context: ToolContext) -> ToolR
 
 # Keep the original handler imports working for SDK users and existing tests.
 save_memory = _save_memory
+update_memory = _update_memory
 search_memory = _search_memory
 
 

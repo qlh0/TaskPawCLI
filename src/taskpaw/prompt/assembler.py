@@ -49,6 +49,10 @@ class PromptAssembler:
             "- Call save_memory only for explicit remember requests, stable preferences, durable "
             "project constraints, user corrections, or reusable decisions. Never store secrets, "
             "temporary status, raw logs, or uncertain claims.",
+            '- When the user corrects or replaces an earlier fact ("改为", "不再使用", '
+            '"之前说错了", "更正", "不是…而是…"), call search_memory first to locate the '
+            "existing entry, then update_memory with its id. Only call save_memory when no "
+            "matching entry exists.",
             "- Call search_memory when the request depends on prior preferences or decisions and "
             "the automatically recalled items are insufficient.",
             "- Call save_skill only when a successful procedure is genuinely reusable; it requires "

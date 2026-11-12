@@ -22,6 +22,14 @@ _WORD_RE = re.compile(r"[a-z0-9_]+")
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 
 
+class MemoryNotFoundError(LookupError):
+    """Raised when the requested memory id does not exist."""
+
+
+class MemoryScopeError(PermissionError):
+    """Raised when the memory belongs to another project scope."""
+
+
 @dataclass(slots=True)
 class MemoryEntry:
     id: int
@@ -132,6 +140,142 @@ class MemoryManager:
                 memory_id = int(cursor.lastrowid)
             self._enforce_quota(conn, protected_id=memory_id)
             return memory_id
+
+    def update(
+        self,
+        memory_id: int,
+        content: str,
+        *,
+        kind: str | None = None,
+        source: str | None = None,
+        importance: float | None = None,
+        confidence: float | None = None,
+        expires_at: str | datetime | None = None,
+    ) -> tuple[MemoryEntry, list[int]]:
+        """Rewrite an existing memory in place.
+
+        The id is preserved. When the new content hashes to another memory in the
+        same scope, that duplicate is merged into this row (max importance and
+        confidence, earliest created_at, summed access count) and removed.
+
+        Returns the updated entry together with the merged memory ids.
+        """
+
+        normalized_id = _positive_int(memory_id, "memory_id")
+        cleaned = _clean_content(content)
+        if len(cleaned) > self.max_content_length:
+            raise ValueError(f"memory content exceeds {self.max_content_length} characters")
+        normalized_kind = _validate_metadata(kind, "kind") if kind is not None else None
+        normalized_source = _validate_metadata(source, "source") if source is not None else None
+        normalized_importance = (
+            _validate_score(importance, "importance") if importance is not None else None
+        )
+        normalized_confidence = (
+            _validate_score(confidence, "confidence") if confidence is not None else None
+        )
+        expiry_given = expires_at is not None
+        normalized_expiry = _normalize_optional_timestamp(expires_at) if expiry_given else None
+
+        content_hash = _hash_content(cleaned)
+        now = _now_iso()
+
+        with self._connect() as conn:
+            conn.execute("begin immediate")
+            self._purge_expired(conn)
+            row = conn.execute(
+                f"select {_ENTRY_COLUMNS} from memories where id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise MemoryNotFoundError(f"memory {normalized_id} does not exist")
+            existing = _entry_from_row(row)
+            if existing.scope != self.scope:
+                raise MemoryScopeError(
+                    f"memory {normalized_id} belongs to a different project scope"
+                )
+
+            unchanged = (
+                content_hash == existing.content_hash
+                and normalized_kind is None
+                and normalized_source is None
+                and normalized_importance is None
+                and normalized_confidence is None
+                and not expiry_given
+            )
+            if unchanged:
+                return existing, []
+
+            final_kind = normalized_kind or existing.kind
+            final_source = normalized_source or existing.source
+            final_importance = (
+                normalized_importance if normalized_importance is not None else existing.importance
+            )
+            final_confidence = (
+                normalized_confidence if normalized_confidence is not None else existing.confidence
+            )
+            final_expiry = normalized_expiry if expiry_given else existing.expires_at
+            created_at = existing.created_at
+            access_count = existing.access_count
+            merged: list[int] = []
+
+            if content_hash != existing.content_hash:
+                duplicate = conn.execute(
+                    f"""
+                    select {_ENTRY_COLUMNS} from memories
+                    where scope = ? and content_hash = ? and id != ?
+                    """,
+                    (self.scope, content_hash, normalized_id),
+                ).fetchone()
+                if duplicate is not None:
+                    other = _entry_from_row(duplicate)
+                    final_importance = max(final_importance, other.importance)
+                    final_confidence = max(final_confidence, other.confidence)
+                    created_at = min(created_at, other.created_at)
+                    access_count += other.access_count
+                    final_expiry = _merge_expiry(final_expiry, other.expires_at)
+                    conn.execute("delete from memories where id = ?", (other.id,))
+                    merged.append(other.id)
+
+            conn.execute(
+                """
+                update memories
+                set content = ?, created_at = ?, kind = ?, source = ?, importance = ?,
+                    confidence = ?, updated_at = ?, expires_at = ?, access_count = ?,
+                    content_hash = ?
+                where id = ? and scope = ?
+                """,
+                (
+                    cleaned,
+                    created_at,
+                    final_kind,
+                    final_source,
+                    final_importance,
+                    final_confidence,
+                    now,
+                    final_expiry,
+                    access_count,
+                    content_hash,
+                    normalized_id,
+                    self.scope,
+                ),
+            )
+            self._enforce_quota(conn, protected_id=normalized_id)
+            updated_row = conn.execute(
+                f"select {_ENTRY_COLUMNS} from memories where id = ?",
+                (normalized_id,),
+            ).fetchone()
+        return _entry_from_row(updated_row), merged
+
+    def get(self, memory_id: int) -> MemoryEntry | None:
+        """Return one memory from the current scope, or ``None``."""
+
+        normalized_id = _positive_int(memory_id, "memory_id")
+        with self._connect() as conn:
+            row = conn.execute(
+                f"select {_ENTRY_COLUMNS} from memories where id = ? and scope = ?",
+                (normalized_id, self.scope),
+            ).fetchone()
+        return _entry_from_row(row) if row is not None else None
 
     def list(self, limit: int = 20, *, kind: str | None = None) -> list[MemoryEntry]:
         normalized_limit = _normalize_limit(limit)

@@ -186,6 +186,7 @@ TaskPaw 内置了一组 Agent 可以调用的本地工具和联网工具：
 - `web_search`
 - `web_fetch`
 - `save_memory`
+- `update_memory`
 - `search_memory`
 - `load_skill`
 - `save_skill`
@@ -222,6 +223,8 @@ TaskPaw 把记忆分成三层：
 - 动态长期记忆：按项目 scope 隔离的 SQLite 记录；包含 kind、source、importance、confidence、TTL、访问次数和内容哈希
 
 动态记忆不会再无条件取“最近 8 条”。每个请求会按当前问题自动召回 Top-K，并把结果放进明确标注为 untrusted data 的动态 Prompt；模型觉得候选不足时，还可以调用 `search_memory` 深搜。写入端会拒绝空值/超长值，通过规范化哈希去重，并按项目容量淘汰低价值记录。
+
+记忆支持按 id 原地更新：`update_memory` 会保留原 id 与创建时间，只更新内容、哈希和更新时间；如果新内容与同一项目下的另一条记忆哈希相同，会把对方合并进来（取较高重要度/置信度、较早创建时间、累加访问次数）并删除重复行。当用户表达修正意图（“改为”“不再使用”“之前说错了”等）时，模型应先 `search_memory` 定位旧记忆，再 `update_memory`，而不是新增一条重复记录。
 
 Prompt 分为可缓存的静态前缀和逐请求重建的动态后缀。静态前缀承载身份、规则和项目指令；动态后缀承载当前时间、cwd、模型、工具以及与当前问题相关的记忆。
 
