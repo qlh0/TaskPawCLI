@@ -24,6 +24,11 @@ dev = [
   "pytest>=8.2.0",
   "ruff>=0.5.0",
 ]
+# Local embeddings + vector search. Kept optional so the base CLI stays small.
+embeddings = [
+  "fastembed>=0.4",
+  "sqlite-vec>=0.1.6",
+]
 
 [build-system]
 requires = ["hatchling"]

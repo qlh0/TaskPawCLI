@@ -4,6 +4,9 @@
 
 ### Added
 
+- 长期记忆支持本地向量检索（可选）：fastembed + sqlite-vec，关键词与向量双路召回、
+  RRF 融合；写入/更新/删除同步维护向量，扩展不可用时自动退回 Python 余弦，换模型后
+  用 `taskpaw memory reindex` 重建，`taskpaw memory stats` 查看状态。
 - 长期记忆支持按 id 原地更新：新增 `update_memory` 工具与 `MemoryManager.update()`，
   保留原 id/创建时间，内容哈希冲突时自动合并重复行；用户表达修正意图时提示模型先搜后改。
 - 两级渐进式上下文压缩：先清理旧工具结果（保留消息与 `tool_call_id`，最近 N 轮与过小结果不动），

@@ -43,6 +43,7 @@ from taskpaw.config import get_config_paths, load_config
 from taskpaw.entrypoints.repl import start_repl
 from taskpaw.llm import create_llm_client
 from taskpaw.mcp import load_mcp_server_specs, serve_http, serve_stdio, write_chrome_devtools_config
+from taskpaw.memory import MemoryManager, create_embedder
 from taskpaw.plan.store import PlanStore
 from taskpaw.runtime import RuntimeApiServer
 from taskpaw.runtime.api import runtime_api_key
@@ -57,6 +58,8 @@ mcp_app = typer.Typer(help="MCP server management")
 app.add_typer(mcp_app, name="mcp")
 plan_app = typer.Typer(help="Inspect stored Plan-mode history")
 app.add_typer(plan_app, name="plan")
+memory_app = typer.Typer(help="Long-term memory utilities")
+app.add_typer(memory_app, name="memory")
 console = Console()
 
 
@@ -487,3 +490,59 @@ def plan_events(
             markup=False,
             highlight=False,
         )
+
+
+# ---------------------------------------------------------------------------
+# memory subcommands
+# ---------------------------------------------------------------------------
+
+
+def _cli_memory_manager(config, root: Path) -> MemoryManager:
+    return MemoryManager(
+        config.memory.long_term_db_path,
+        scope=str(root),
+        max_entries=config.memory.max_long_term_entries,
+        max_content_length=config.memory.max_memory_chars,
+        embedder=create_embedder(config),
+        embedding_min_similarity=config.embeddings.min_similarity,
+        candidate_depth=config.embeddings.candidate_depth,
+        rrf_k=config.embeddings.rrf_k,
+    )
+
+
+@memory_app.command("stats")
+def memory_stats(
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Project directory")] = None,
+) -> None:
+    """Show long-term memory counts and vector index status."""
+    root = (cwd or Path.cwd()).resolve()
+    config = load_config(project_root=root)
+    manager = _cli_memory_manager(config, root)
+    stats = manager.stats()
+    payload = {
+        **stats,
+        "embeddings": {
+            "enabled": config.embeddings.enabled,
+            "model": config.embeddings.model if config.embeddings.enabled else None,
+            "skip_reason": manager.vector_skip_reason or None,
+        },
+    }
+    console.print_json(json.dumps(payload, ensure_ascii=False))
+
+
+@memory_app.command("reindex")
+def memory_reindex(
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Project directory")] = None,
+) -> None:
+    """Rebuild memory vectors with the configured embedding model."""
+    root = (cwd or Path.cwd()).resolve()
+    config = load_config(project_root=root)
+    manager = _cli_memory_manager(config, root)
+    if manager.embedder is None:
+        typer.echo(
+            "Embeddings are disabled. Set embeddings.enabled=true in .taskpaw/config.json.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    count = manager.reindex()
+    typer.echo(f"Reindexed {count} memories with {manager.embedder.model_name}")

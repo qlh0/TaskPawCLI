@@ -226,6 +226,35 @@ TaskPaw 把记忆分成三层：
 
 记忆支持按 id 原地更新：`update_memory` 会保留原 id 与创建时间，只更新内容、哈希和更新时间；如果新内容与同一项目下的另一条记忆哈希相同，会把对方合并进来（取较高重要度/置信度、较早创建时间、累加访问次数）并删除重复行。当用户表达修正意图（“改为”“不再使用”“之前说错了”等）时，模型应先 `search_memory` 定位旧记忆，再 `update_memory`，而不是新增一条重复记录。
 
+## 向量检索（可选）
+
+装好可选依赖后，长期记忆会从“纯关键词召回”升级为“关键词 + 向量”的混合召回：
+
+```bash
+uv sync --extra dev --extra embeddings
+```
+
+在 `.taskpaw/config.json` 打开：
+
+```json
+{
+  "embeddings": {
+    "enabled": true,
+    "backend": "fastembed",
+    "model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "dim": 384,
+    "min_similarity": 0.25
+  }
+}
+```
+
+- 本地 ONNX 推理（fastembed），不依赖 torch，模型首次使用时下载到 `~/.taskpaw/models`；
+- 写入/更新/删除记忆时同步维护向量，`sqlite-vec` 可用时用它做近邻检索，不可用时自动退回纯 Python 余弦；
+- 两路召回用 RRF 融合，去重后取 Top-K；向量不可用或模型变化时自动降级为关键词召回；
+- 换模型后需要重建：`taskpaw memory reindex --cwd .`，`taskpaw memory stats` 可查看状态。
+
+注意：`uv sync` 是精确同步，只写 `--extra dev` 会把 embedding 依赖卸掉。
+
 Prompt 分为可缓存的静态前缀和逐请求重建的动态后缀。静态前缀承载身份、规则和项目指令；动态后缀承载当前时间、cwd、模型、工具以及与当前问题相关的记忆。
 
 可用输入预算按 `context_window - max_output_tokens - reserve_tokens` 计算。默认在该预算的 80% 触发压缩，分两级渐进进行：

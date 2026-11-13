@@ -4,7 +4,12 @@ import asyncio
 import os
 from typing import Any
 
-from taskpaw.memory import MemoryManager, MemoryNotFoundError, MemoryScopeError
+from taskpaw.memory import (
+    MemoryManager,
+    MemoryNotFoundError,
+    MemoryScopeError,
+    create_embedder,
+)
 from taskpaw.policy import CommandGuard
 from taskpaw.rag import CodeIndex
 from taskpaw.skill import SkillRegistry
@@ -565,15 +570,24 @@ async def _web_fetch(payload: dict[str, Any], _context: ToolContext) -> ToolResu
 # ---------------------------------------------------------------------------
 
 
+def _memory_manager(context: ToolContext) -> MemoryManager:
+    settings = context.config
+    return MemoryManager(
+        settings.memory.long_term_db_path,
+        scope=context.cwd,
+        max_entries=settings.memory.max_long_term_entries,
+        max_content_length=settings.memory.max_memory_chars,
+        embedder=create_embedder(settings),
+        embedding_min_similarity=settings.embeddings.min_similarity,
+        candidate_depth=settings.embeddings.candidate_depth,
+        rrf_k=settings.embeddings.rrf_k,
+    )
+
+
 async def _save_memory(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     if not context.config.features.memory or not context.config.memory.long_term_enabled:
         return ToolResult("Long-term memory is disabled.", is_error=True)
-    manager = MemoryManager(
-        context.config.memory.long_term_db_path,
-        scope=context.cwd,
-        max_entries=context.config.memory.max_long_term_entries,
-        max_content_length=context.config.memory.max_memory_chars,
-    )
+    manager = _memory_manager(context)
     memory_id = manager.save(
         str(payload["content"]),
         kind=str(payload.get("kind") or "fact"),
@@ -592,12 +606,7 @@ async def _update_memory(payload: dict[str, Any], context: ToolContext) -> ToolR
         memory_id = int(payload["memory_id"])
     except (TypeError, ValueError):
         return ToolResult("update_memory memory_id must be an integer", is_error=True)
-    manager = MemoryManager(
-        context.config.memory.long_term_db_path,
-        scope=context.cwd,
-        max_entries=context.config.memory.max_long_term_entries,
-        max_content_length=context.config.memory.max_memory_chars,
-    )
+    manager = _memory_manager(context)
     try:
         entry, merged = manager.update(
             memory_id,
@@ -626,12 +635,7 @@ async def _search_memory(payload: dict[str, Any], context: ToolContext) -> ToolR
     raw_kinds = payload.get("kinds")
     if raw_kinds is not None and not isinstance(raw_kinds, list):
         return ToolResult("search_memory kinds must be an array of strings.", is_error=True)
-    manager = MemoryManager(
-        context.config.memory.long_term_db_path,
-        scope=context.cwd,
-        max_entries=context.config.memory.max_long_term_entries,
-        max_content_length=context.config.memory.max_memory_chars,
-    )
+    manager = _memory_manager(context)
     rows = manager.recall(
         str(payload["query"]),
         limit=int(payload.get("limit") or context.config.memory.recall_limit),

@@ -134,6 +134,25 @@ class LoopConfig:
 
 
 @dataclass(slots=True)
+class EmbeddingConfig:
+    """Local embeddings used for hybrid memory/code retrieval."""
+
+    enabled: bool = False
+    # fastembed (ONNX, local) | hash (deterministic, tests only)
+    backend: str = "fastembed"
+    model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    dim: int = 384
+    cache_dir: str = "~/.taskpaw/models"
+    batch_size: int = 32
+    threads: int = 4
+    # Minimum cosine similarity for a vector hit to enter RRF fusion.
+    min_similarity: float = 0.25
+    # Candidates taken from each retriever before fusion.
+    candidate_depth: int = 30
+    rrf_k: int = 60
+
+
+@dataclass(slots=True)
 class PlanConfig:
     """Failure handling and human review for Plan-and-Execute runs."""
 
@@ -166,6 +185,7 @@ class TaskPawConfig:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
     plan: PlanConfig = field(default_factory=PlanConfig)
+    embeddings: EmbeddingConfig = field(default_factory=EmbeddingConfig)
 
 
 def load_config(
@@ -346,6 +366,7 @@ def _dict_to_config(data: dict[str, Any]) -> TaskPawConfig:
         features=FeatureConfig(**data.get("features", {})),
         loop=LoopConfig(**data.get("loop", {})),
         plan=PlanConfig(**data.get("plan", {})),
+        embeddings=EmbeddingConfig(**data.get("embeddings", {})),
     )
 
 

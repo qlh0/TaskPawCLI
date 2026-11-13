@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 from taskpaw.config import TaskPawConfig
-from taskpaw.memory import MemoryManager
+from taskpaw.memory import MemoryManager, create_embedder
 
 
 class PromptAssembler:
@@ -135,6 +135,10 @@ class PromptAssembler:
             scope=self.cwd,
             max_entries=self.config.memory.max_long_term_entries,
             max_content_length=self.config.memory.max_memory_chars,
+            embedder=create_embedder(self.config),
+            embedding_min_similarity=self.config.embeddings.min_similarity,
+            candidate_depth=self.config.embeddings.candidate_depth,
+            rrf_k=self.config.embeddings.rrf_k,
         )
         memories = manager.recall(
             user_message,

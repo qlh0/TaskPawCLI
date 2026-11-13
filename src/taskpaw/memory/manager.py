@@ -6,10 +6,14 @@ import re
 import sqlite3
 import unicodedata
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from taskpaw.memory.embedding import Embedder
+from taskpaw.memory.vector_store import MemoryVectorIndex, reset_index
 
 DEFAULT_MAX_ENTRIES_PER_SCOPE = 1_000
 DEFAULT_MAX_CONTENT_LENGTH = 8_000
@@ -54,11 +58,20 @@ class MemoryManager:
         *,
         max_entries: int = DEFAULT_MAX_ENTRIES_PER_SCOPE,
         max_content_length: int = DEFAULT_MAX_CONTENT_LENGTH,
+        embedder: Embedder | None = None,
+        embedding_min_similarity: float = 0.25,
+        candidate_depth: int = 30,
+        rrf_k: int = 60,
     ):
         self.db_path = Path(db_path).expanduser()
         self.scope = str(scope)
         self.max_entries = _positive_int(max_entries, "max_entries")
         self.max_content_length = _positive_int(max_content_length, "max_content_length")
+        self.embedder = embedder
+        self.embedding_min_similarity = float(embedding_min_similarity)
+        self.candidate_depth = max(1, int(candidate_depth))
+        self.rrf_k = max(1, int(rrf_k))
+        self.vector_skip_reason = ""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
@@ -82,6 +95,7 @@ class MemoryManager:
         normalized_expiry = _normalize_optional_timestamp(expires_at)
         now = _now_iso()
         content_hash = _hash_content(cleaned)
+        vector = self._embed_one(cleaned)
 
         with self._connect() as conn:
             conn.execute("begin immediate")
@@ -139,6 +153,7 @@ class MemoryManager:
                 )
                 memory_id = int(cursor.lastrowid)
             self._enforce_quota(conn, protected_id=memory_id)
+            self._store_vector(conn, memory_id, vector)
             return memory_id
 
     def update(
@@ -217,6 +232,9 @@ class MemoryManager:
             created_at = existing.created_at
             access_count = existing.access_count
             merged: list[int] = []
+            vector: list[float] | None = None
+            if content_hash != existing.content_hash:
+                vector = self._embed_one(cleaned)
 
             if content_hash != existing.content_hash:
                 duplicate = conn.execute(
@@ -260,6 +278,10 @@ class MemoryManager:
                 ),
             )
             self._enforce_quota(conn, protected_id=normalized_id)
+            if vector is not None:
+                self._store_vector(conn, normalized_id, vector)
+            if merged:
+                self._delete_vectors(conn, merged)
             updated_row = conn.execute(
                 f"select {_ENTRY_COLUMNS} from memories where id = ?",
                 (normalized_id,),
@@ -330,12 +352,40 @@ class MemoryManager:
             if not normalized_kinds:
                 return []
 
+        keyword_entries = self._keyword_candidates(
+            cleaned_query,
+            normalized_kinds,
+            min_score=min_score,
+            depth=max(normalized_limit, self.candidate_depth),
+        )
+        vector_entries: list[MemoryEntry] = []
+        if self.embedder is not None:
+            try:
+                vector_entries = self._vector_candidates(cleaned_query, normalized_kinds)
+            except Exception:  # noqa: BLE001 - vectors are best effort
+                vector_entries = []
+
+        selected = self._fuse(keyword_entries, vector_entries, normalized_limit)
+        if mark_access and selected:
+            self.mark_access(entry.id for entry in selected)
+            for entry in selected:
+                entry.access_count += 1
+        return selected
+
+    def _keyword_candidates(
+        self,
+        query: str,
+        kinds: set[str] | None,
+        *,
+        min_score: float,
+        depth: int,
+    ) -> list[MemoryEntry]:
         params: list[Any] = [self.scope, _now_iso()]
         kinds_clause = ""
-        if normalized_kinds:
-            placeholders = ", ".join("?" for _ in normalized_kinds)
+        if kinds:
+            placeholders = ", ".join("?" for _ in kinds)
             kinds_clause = f" and kind in ({placeholders})"
-            params.extend(sorted(normalized_kinds))
+            params.extend(sorted(kinds))
 
         with self._connect() as conn:
             self._purge_expired(conn)
@@ -354,7 +404,7 @@ class MemoryManager:
         ranked: list[tuple[float, MemoryEntry]] = []
         for row in rows:
             entry = _entry_from_row(row)
-            score = _relevance_score(cleaned_query, entry, now)
+            score = _relevance_score(query, entry, now)
             if score > 0 and score >= float(min_score):
                 ranked.append((score, entry))
         ranked.sort(
@@ -367,12 +417,152 @@ class MemoryManager:
             ),
             reverse=True,
         )
-        selected = [entry for _score, entry in ranked[:normalized_limit]]
-        if mark_access and selected:
-            self.mark_access(entry.id for entry in selected)
-            for entry in selected:
-                entry.access_count += 1
-        return selected
+        return [entry for _score, entry in ranked[:depth]]
+
+    def _vector_candidates(
+        self,
+        query: str,
+        kinds: set[str] | None,
+    ) -> list[MemoryEntry]:
+        if self.embedder is None:
+            return []
+        vectors = self.embedder.embed([query])
+        if not vectors:
+            return []
+        with self._connect() as conn:
+            self._purge_expired(conn)
+            index = self._vector_index(conn)
+            if index is None:
+                return []
+            hits = index.search(
+                vectors[0],
+                limit=self.candidate_depth,
+                min_similarity=self.embedding_min_similarity,
+            )
+            if not hits:
+                return []
+            ids = [memory_id for memory_id, _score in hits]
+            placeholders = ", ".join("?" for _ in ids)
+            rows = conn.execute(
+                f"""
+                select {_ENTRY_COLUMNS} from memories
+                where scope = ?
+                  and id in ({placeholders})
+                  and (expires_at is null or expires_at > ?)
+                """,
+                [self.scope, *ids, _now_iso()],
+            ).fetchall()
+
+        by_id = {entry.id: entry for entry in (_entry_from_row(row) for row in rows)}
+        entries = [by_id[memory_id] for memory_id in ids if memory_id in by_id]
+        if kinds:
+            entries = [entry for entry in entries if entry.kind in kinds]
+        return entries
+
+    def _fuse(
+        self,
+        keyword: list[MemoryEntry],
+        vector: list[MemoryEntry],
+        limit: int,
+    ) -> list[MemoryEntry]:
+        """Reciprocal Rank Fusion over the keyword and vector candidate lists."""
+
+        if not vector:
+            return keyword[:limit]
+        by_id = {entry.id: entry for entry in keyword}
+        by_id.update({entry.id: entry for entry in vector})
+        scores: dict[int, float] = {}
+        for rank, entry in enumerate(keyword, start=1):
+            scores[entry.id] = scores.get(entry.id, 0.0) + 1.0 / (self.rrf_k + rank)
+        for rank, entry in enumerate(vector, start=1):
+            scores[entry.id] = scores.get(entry.id, 0.0) + 1.0 / (self.rrf_k + rank)
+        ordered = sorted(
+            scores.items(),
+            key=lambda item: (item[1], by_id[item[0]].importance, by_id[item[0]].updated_at),
+            reverse=True,
+        )
+        return [by_id[memory_id] for memory_id, _score in ordered[:limit]]
+
+    # ------------------------------------------------------------------
+    # Vector index maintenance
+    # ------------------------------------------------------------------
+
+    def _embed_one(self, content: str) -> list[float] | None:
+        if self.embedder is None:
+            return None
+        try:
+            vectors = self.embedder.embed([content])
+        except Exception:  # noqa: BLE001 - degrade to keyword-only recall
+            self.vector_skip_reason = "embedding failed; using keyword recall only"
+            return None
+        return vectors[0] if vectors else None
+
+    def _vector_index(self, conn: sqlite3.Connection) -> MemoryVectorIndex | None:
+        if self.embedder is None:
+            return None
+        index = MemoryVectorIndex(conn, dim=self.embedder.dim, model=self.embedder.model_name)
+        stored = index.meta()
+        if stored is None:
+            index.write_meta()
+        elif stored != (index.model, index.dim):
+            self.vector_skip_reason = (
+                f"embedding model changed from {stored[0]} to {index.model}; "
+                "run `taskpaw memory reindex`"
+            )
+            return None
+        return index
+
+    def _store_vector(
+        self,
+        conn: sqlite3.Connection,
+        memory_id: int,
+        vector: list[float] | None,
+    ) -> None:
+        if vector is None:
+            return
+        index = self._vector_index(conn)
+        if index is None:
+            return
+        try:
+            index.upsert(memory_id, vector)
+            index.prune_orphans()
+        except sqlite3.Error:
+            self.vector_skip_reason = "failed to store memory vector"
+
+    def _delete_vectors(self, conn: sqlite3.Connection, ids: Iterable[int]) -> None:
+        if self.embedder is None:
+            return
+        index = self._vector_index(conn)
+        if index is None:
+            return
+        with suppress(sqlite3.Error):
+            index.delete(ids)
+
+    def reindex(self) -> int:
+        """Rebuild every vector in this scope with the current embedding model."""
+
+        if self.embedder is None:
+            raise ValueError("embeddings are not enabled")
+        with self._connect() as conn:
+            self._purge_expired(conn)
+            reset_index(conn)
+            index = MemoryVectorIndex(
+                conn,
+                dim=self.embedder.dim,
+                model=self.embedder.model_name,
+            )
+            index.write_meta()
+            rows = conn.execute(
+                "select id, content from memories where scope = ? "
+                "and (expires_at is null or expires_at > ?)",
+                (self.scope, _now_iso()),
+            ).fetchall()
+            if not rows:
+                return 0
+            vectors = self.embedder.embed([str(row["content"]) for row in rows])
+            for row, vector in zip(rows, vectors, strict=False):
+                index.upsert(int(row["id"]), vector)
+        return len(rows)
 
     def mark_access(self, memory_ids: int | Iterable[int]) -> int:
         ids = [memory_ids] if isinstance(memory_ids, int) else list(memory_ids)
@@ -440,11 +630,21 @@ class MemoryManager:
                 "delete from memories where scope = ? and id = ?",
                 (self.scope, int(memory_id)),
             )
-            return bool(cursor.rowcount)
+            if not cursor.rowcount:
+                return False
+            self._delete_vectors(conn, [int(memory_id)])
+            return True
 
     def clear(self) -> int:
         with self._connect() as conn:
+            ids = [
+                int(row[0])
+                for row in conn.execute(
+                    "select id from memories where scope = ?", (self.scope,)
+                ).fetchall()
+            ]
             cursor = conn.execute("delete from memories where scope = ?", (self.scope,))
+            self._delete_vectors(conn, ids)
             return int(cursor.rowcount)
 
     def _ensure_schema(self) -> None:
