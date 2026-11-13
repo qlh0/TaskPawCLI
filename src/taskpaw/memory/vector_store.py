@@ -1,9 +1,11 @@
-"""vector_store.py — sqlite-vec backed memory vectors with a Python fallback.
+"""vector_store.py — sqlite-vec backed vector tables with a Python fallback.
 
 Vectors are always normalised before being stored, so the L2 distance returned by
 sqlite-vec can be converted back to cosine similarity. When the extension is not
-available the same interface falls back to a blob table plus a Python cosine scan,
-which is fine for the per-project memory cap (1k entries by default).
+available the same interface falls back to a blob table plus a Python cosine scan.
+
+The class is generic over table/column names: long-term memory uses the default
+``memory_*`` tables while the code index passes its own ``code_*`` tables.
 """
 
 from __future__ import annotations
@@ -37,17 +39,27 @@ def load_sqlite_vec(conn: sqlite3.Connection) -> bool:
             conn.enable_load_extension(False)
 
 
-class MemoryVectorIndex:
+class VectorIndex:
     def __init__(
         self,
         conn: sqlite3.Connection,
         *,
         dim: int,
         model: str,
+        vec_table: str = VEC_TABLE,
+        blob_table: str = BLOB_TABLE,
+        meta_table: str = META_TABLE,
+        id_column: str = "memory_id",
+        orphan_parent: str | None = None,
     ) -> None:
         self.conn = conn
         self.dim = max(1, int(dim))
         self.model = str(model)
+        self.vec_table = vec_table
+        self.blob_table = blob_table
+        self.meta_table = meta_table
+        self.id_column = id_column
+        self.orphan_parent = orphan_parent
         self.kind = "vec0" if load_sqlite_vec(conn) else "blob"
         self._ensure_schema()
 
@@ -57,22 +69,24 @@ class MemoryVectorIndex:
 
     def _ensure_schema(self) -> None:
         self.conn.execute(
-            f"create table if not exists {META_TABLE}(key text primary key, value text not null)"
+            f"create table if not exists {self.meta_table}"
+            "(key text primary key, value text not null)"
         )
         if self.kind == "vec0":
             self.conn.execute(
-                f"create virtual table if not exists {VEC_TABLE} "
-                f"using vec0(memory_id integer primary key, embedding float[{self.dim}])"
+                f"create virtual table if not exists {self.vec_table} "
+                f"using vec0({self.id_column} integer primary key, embedding float[{self.dim}])"
             )
         else:
             self.conn.execute(
-                f"create table if not exists {BLOB_TABLE}("
-                "memory_id integer primary key, dim integer not null, vector blob not null)"
+                f"create table if not exists {self.blob_table}("
+                f"{self.id_column} integer primary key, dim integer not null, "
+                "vector blob not null)"
             )
 
     def meta(self) -> tuple[str, int] | None:
         row = self.conn.execute(
-            f"select key, value from {META_TABLE} where key in ('model', 'dim')"
+            f"select key, value from {self.meta_table} where key in ('model', 'dim')"
         ).fetchall()
         values = {str(key): str(value) for key, value in row}
         if "model" not in values or "dim" not in values:
@@ -84,7 +98,7 @@ class MemoryVectorIndex:
 
     def write_meta(self) -> None:
         self.conn.executemany(
-            f"insert or replace into {META_TABLE}(key, value) values (?, ?)",
+            f"insert or replace into {self.meta_table}(key, value) values (?, ?)",
             (("model", self.model), ("dim", str(self.dim))),
         )
 
@@ -92,44 +106,57 @@ class MemoryVectorIndex:
     # Writes
     # ------------------------------------------------------------------
 
-    def upsert(self, memory_id: int, vector: Sequence[float]) -> None:
+    def upsert(self, vector_id: int, vector: Sequence[float]) -> None:
         normalized = _normalize(vector)
         if not normalized:
             return
         packed = _pack(normalized, self.dim)
         if self.kind == "vec0":
-            self.conn.execute(f"delete from {VEC_TABLE} where memory_id = ?", (int(memory_id),))
             self.conn.execute(
-                f"insert into {VEC_TABLE}(memory_id, embedding) values (?, ?)",
-                (int(memory_id), packed),
+                f"delete from {self.vec_table} where {self.id_column} = ?", (int(vector_id),)
+            )
+            self.conn.execute(
+                f"insert into {self.vec_table}({self.id_column}, embedding) values (?, ?)",
+                (int(vector_id), packed),
             )
         else:
             self.conn.execute(
-                f"insert or replace into {BLOB_TABLE}(memory_id, dim, vector) values (?, ?, ?)",
-                (int(memory_id), self.dim, packed),
+                f"insert or replace into {self.blob_table}"
+                f"({self.id_column}, dim, vector) values (?, ?, ?)",
+                (int(vector_id), self.dim, packed),
             )
 
-    def delete(self, memory_ids: Iterable[int]) -> int:
-        ids = [int(memory_id) for memory_id in memory_ids]
+    def delete(self, vector_ids: Iterable[int]) -> int:
+        ids = [int(vector_id) for vector_id in vector_ids]
         if not ids:
             return 0
-        table = VEC_TABLE if self.kind == "vec0" else BLOB_TABLE
+        table = self.vec_table if self.kind == "vec0" else self.blob_table
         removed = 0
         for start in range(0, len(ids), 500):
             chunk = ids[start : start + 500]
             placeholders = ", ".join("?" for _ in chunk)
             cursor = self.conn.execute(
-                f"delete from {table} where memory_id in ({placeholders})", chunk
+                f"delete from {table} where {self.id_column} in ({placeholders})", chunk
             )
             removed += int(cursor.rowcount)
         return removed
 
     def clear(self) -> None:
-        for table in (VEC_TABLE, BLOB_TABLE):
-            try:
+        for table in (self.vec_table, self.blob_table):
+            with suppress(sqlite3.Error):
                 self.conn.execute(f"delete from {table}")
-            except sqlite3.Error:
-                continue
+
+    def prune_orphans(self) -> None:
+        """Drop vectors whose parent row no longer exists (quota/rebuild cleanup)."""
+
+        if not self.orphan_parent:
+            return
+        table = self.vec_table if self.kind == "vec0" else self.blob_table
+        with suppress(sqlite3.Error):
+            self.conn.execute(
+                f"delete from {table} where {self.id_column} not in "
+                f"(select id from {self.orphan_parent})"
+            )
 
     # ------------------------------------------------------------------
     # Reads
@@ -149,55 +176,66 @@ class MemoryVectorIndex:
         if self.kind == "vec0":
             packed = _pack(query, self.dim)
             rows = self.conn.execute(
-                f"select memory_id, distance from {VEC_TABLE} "
+                f"select {self.id_column}, distance from {self.vec_table} "
                 f"where embedding match ? and k = {max(1, int(limit))}",
                 (packed,),
             ).fetchall()
-            for memory_id, distance in rows:
+            for vector_id, distance in rows:
                 similarity = 1.0 - (float(distance) ** 2) / 2.0
-                hits.append((int(memory_id), max(-1.0, min(1.0, similarity))))
+                hits.append((int(vector_id), max(-1.0, min(1.0, similarity))))
         else:
-            rows = self.conn.execute(f"select memory_id, vector from {BLOB_TABLE}").fetchall()
-            for memory_id, blob in rows:
+            rows = self.conn.execute(
+                f"select {self.id_column}, vector from {self.blob_table}"
+            ).fetchall()
+            for vector_id, blob in rows:
                 similarity = _cosine(query, _unpack(blob, self.dim))
-                hits.append((int(memory_id), similarity))
+                hits.append((int(vector_id), similarity))
 
         filtered = [item for item in hits if item[1] >= min_similarity]
         filtered.sort(key=lambda item: item[1], reverse=True)
         return filtered[: max(1, int(limit))]
 
     def count(self) -> int:
-        table = VEC_TABLE if self.kind == "vec0" else BLOB_TABLE
+        table = self.vec_table if self.kind == "vec0" else self.blob_table
         try:
             row = self.conn.execute(f"select count(*) from {table}").fetchone()
         except sqlite3.Error:
             return 0
         return int(row[0]) if row else 0
 
-    def prune_orphans(self) -> None:
-        """Drop vectors whose memory row no longer exists (quota eviction)."""
 
-        table = VEC_TABLE if self.kind == "vec0" else BLOB_TABLE
-        try:
-            self.conn.execute(
-                f"delete from {table} where memory_id not in (select id from memories)"
-            )
-        except sqlite3.Error:
-            return
+class MemoryVectorIndex(VectorIndex):
+    """Long-term memory index (kept as a named subclass for compatibility)."""
+
+    def __init__(self, conn: sqlite3.Connection, *, dim: int, model: str) -> None:
+        super().__init__(
+            conn,
+            dim=dim,
+            model=model,
+            vec_table=VEC_TABLE,
+            blob_table=BLOB_TABLE,
+            meta_table=META_TABLE,
+            id_column="memory_id",
+            orphan_parent="memories",
+        )
 
 
-def reset_index(conn: sqlite3.Connection) -> None:
-    """Drop all vector tables so the next index can be rebuilt from scratch."""
+def reset_index(
+    conn: sqlite3.Connection,
+    *,
+    vec_table: str = VEC_TABLE,
+    blob_table: str = BLOB_TABLE,
+    meta_table: str = META_TABLE,
+) -> None:
+    """Drop vector tables so the next index can be rebuilt from scratch."""
 
     for statement in (
-        f"drop table if exists {VEC_TABLE}",
-        f"drop table if exists {BLOB_TABLE}",
-        f"drop table if exists {META_TABLE}",
+        f"drop table if exists {vec_table}",
+        f"drop table if exists {blob_table}",
+        f"drop table if exists {meta_table}",
     ):
-        try:
+        with suppress(sqlite3.Error):
             conn.execute(statement)
-        except sqlite3.Error:
-            continue
 
 
 def _pack(vector: Sequence[float], dim: int) -> bytes:

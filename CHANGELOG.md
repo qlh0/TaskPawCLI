@@ -4,6 +4,8 @@
 
 ### Added
 
+- 代码库 RAG：按 AST 函数/类/方法切块，增量索引（文件哈希），FTS5 关键词 + 向量双路召回、
+  RRF 融合；`search_code` 返回带行号范围的代码块，新增 `taskpaw index [--rebuild]`。
 - 长期记忆支持本地向量检索（可选）：fastembed + sqlite-vec，关键词与向量双路召回、
   RRF 融合；写入/更新/删除同步维护向量，扩展不可用时自动退回 Python 余弦，换模型后
   用 `taskpaw memory reindex` 重建，`taskpaw memory stats` 查看状态。

@@ -29,7 +29,7 @@ from taskpaw.llm.model_profiles import (
     CustomModelStore,
     ModelProfile,
 )
-from taskpaw.memory import MemoryManager
+from taskpaw.memory import MemoryManager, create_embedder
 from taskpaw.plan import ExecutionPlan, PlanDecision
 from taskpaw.policy import AuditLog
 from taskpaw.prompt import PromptAssembler
@@ -280,11 +280,11 @@ async def _handle_slash(
             json.dumps(AuditLog(config.policy.audit_log_path).tail(limit), ensure_ascii=False)
         )
     elif command == "/index":
-        count = CodeIndex(cwd).rebuild(arg or ".")
-        console.print(f"Indexed {count} code lines.")
+        count = _code_index(cwd, config).rebuild(arg or ".")
+        console.print(f"Indexed {count} code chunks.")
     elif command == "/search":
-        results = CodeIndex(cwd).search(arg, limit=20)
-        output = "\n".join(f"{r.path}:{r.line}: {r.snippet}" for r in results)
+        results = _code_index(cwd, config).search(arg, limit=20)
+        output = "\n".join(_format_code_result(result) for result in results)
         console.print(output or "(no matches)")
     elif command == "/plan":
         if not arg:
@@ -658,6 +658,24 @@ def _plan_approval_prompt(plan: ExecutionPlan, console: Console) -> PlanDecision
         feedback = Prompt.ask("修改意见").strip()
         return PlanDecision("revise", feedback)
     return PlanDecision("approve")
+
+
+def _code_index(cwd: str, config: TaskPawConfig) -> CodeIndex:
+    return CodeIndex(
+        cwd,
+        embedder=create_embedder(config),
+        min_similarity=config.embeddings.min_similarity,
+        candidate_depth=config.embeddings.candidate_depth,
+        rrf_k=config.embeddings.rrf_k,
+    )
+
+
+def _format_code_result(result) -> str:
+    location = f"{result.path}:{result.line}"
+    if result.end_line and result.end_line != result.line:
+        location += f"-{result.end_line}"
+    label = f" [{result.kind} {result.name}]" if result.name else ""
+    return f"{location}{label}: {result.snippet}"
 
 
 def _approval_prompt(

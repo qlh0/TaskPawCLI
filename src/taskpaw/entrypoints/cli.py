@@ -45,6 +45,7 @@ from taskpaw.llm import create_llm_client
 from taskpaw.mcp import load_mcp_server_specs, serve_http, serve_stdio, write_chrome_devtools_config
 from taskpaw.memory import MemoryManager, create_embedder
 from taskpaw.plan.store import PlanStore
+from taskpaw.rag import CodeIndex
 from taskpaw.runtime import RuntimeApiServer
 from taskpaw.runtime.api import runtime_api_key
 
@@ -378,6 +379,32 @@ async def _run_prompt(
                 "incomplete. Re-run with a higher turn budget or a narrower request.",
                 err=True,
             )
+
+
+@app.command("index")
+def index_code(
+    path: Annotated[Path | None, typer.Argument(help="File or directory to index")] = None,
+    rebuild: Annotated[
+        bool, typer.Option("--rebuild", help="Rebuild the whole index instead of updating")
+    ] = False,
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Project directory")] = None,
+) -> None:
+    """Index the codebase for `search_code` (chunks + optional vectors)."""
+    root = (cwd or Path.cwd()).resolve()
+    config = load_config(project_root=root)
+    index = CodeIndex(
+        root,
+        embedder=create_embedder(config),
+        min_similarity=config.embeddings.min_similarity,
+        candidate_depth=config.embeddings.candidate_depth,
+        rrf_k=config.embeddings.rrf_k,
+    )
+    target = path or root
+    count = index.rebuild(target) if rebuild else index.update(target)
+    mode = "rebuilt" if rebuild else "updated"
+    typer.echo(f"{mode} {count} code chunks")
+    if index.vector_skip_reason:
+        typer.echo(f"note: {index.vector_skip_reason}", err=True)
 
 
 def _version_of(command: str) -> str:

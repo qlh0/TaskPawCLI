@@ -386,7 +386,10 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="search_code",
-            description="Search the local code index for semantically relevant lines.",
+            description=(
+                "Search the local code index (function/class chunks) with keyword and optional "
+                "semantic retrieval; returns file paths with line ranges."
+            ),
             parameters=object_schema(
                 {
                     "query": {"type": "string", "description": "Search query"},
@@ -725,11 +728,24 @@ load_skill = _load_skill
 
 
 async def _search_code(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    index = CodeIndex(context.cwd)
-    results = index.search(str(payload["query"]), limit=int(payload.get("limit") or 20))
+    index = CodeIndex(
+        context.cwd,
+        embedder=create_embedder(context.config),
+        min_similarity=context.config.embeddings.min_similarity,
+        candidate_depth=context.config.embeddings.candidate_depth,
+        rrf_k=context.config.embeddings.rrf_k,
+    )
+    results = index.search(str(payload["query"]), limit=int(payload.get("limit") or 8))
     if not results:
-        return ToolResult("(no indexed matches; run /index first)")
-    return ToolResult("\n".join(f"{item.path}:{item.line}: {item.snippet}" for item in results))
+        return ToolResult("(no indexed matches; run /index or `taskpaw index` first)")
+    blocks = []
+    for item in results:
+        location = f"{item.path}:{item.line}"
+        if item.end_line and item.end_line != item.line:
+            location += f"-{item.end_line}"
+        label = f" [{item.kind} {item.name}]" if item.name else ""
+        blocks.append(f"{location}{label}\n{item.snippet}")
+    return ToolResult("\n\n".join(blocks), display_summary=f"Found {len(results)} code chunks")
 
 
 # ---------------------------------------------------------------------------

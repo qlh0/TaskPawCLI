@@ -255,6 +255,23 @@ uv sync --extra dev --extra embeddings
 
 注意：`uv sync` 是精确同步，只写 `--extra dev` 会把 embedding 依赖卸掉。
 
+## 代码库 RAG
+
+代码索引现在按"块"而不是"行"组织：
+
+```bash
+taskpaw index --cwd .            # 增量索引（文件哈希没变就跳过）
+taskpaw index --cwd . --rebuild  # 全量重建
+```
+
+- **切块**：Python 用 AST 按函数/类/方法切分（类只保留头部，方法单独成块），其他文本文件按空行块切分；单块上限 120 行，超长自动分段；
+- **增量**：每个文件记录内容哈希，未变化不重复切块与编码；文件删除后对应块自动清理；
+- **检索**：关键词（FTS5，缺失时回退 LIKE）与向量两路召回，RRF 融合后返回 5~8 个块；
+- **工具**：`search_code` 返回 `path:起始行-结束行` 和块名（如 `[method PlanExecuteAgent._repair_plan]`），模型能直接定位源码；
+- **降级**：没装 embedding 依赖或模型不可用时只走关键词，行为与以前一致。
+
+索引文件在项目的 `.taskpaw/code_index.sqlite3`（已加入 `.gitignore`）。
+
 Prompt 分为可缓存的静态前缀和逐请求重建的动态后缀。静态前缀承载身份、规则和项目指令；动态后缀承载当前时间、cwd、模型、工具以及与当前问题相关的记忆。
 
 可用输入预算按 `context_window - max_output_tokens - reserve_tokens` 计算。默认在该预算的 80% 触发压缩，分两级渐进进行：
